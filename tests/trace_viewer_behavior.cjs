@@ -15,6 +15,8 @@ const events = [
   { kind: "telemetry", timestamp: "2026-09-16T10:00:02.000+00:00", speed_mps: 0.6, steering_deg: 12, command: { target_angle_deg: 90, speed_mps: 1 } },
   { kind: "tool", tool: "set_motion", timestamp: "2026-09-16T10:00:03.000+00:00", arguments: { direction: "left", steering_percent: 50, speed_mps: 1, duration_s: 10, reason: "go" }, outcome: { status: "accepted" } },
   { kind: "tool", tool: "observe", timestamp: "2026-09-16T10:00:06.000+00:00", images: [{ url: image(2), camera: "narrow" }] },
+  { kind: "tool", tool: "chunk", timestamp: "2026-09-16T10:00:07.000+00:00", arguments: { curvature_inv_m: [0], speed_mps: [1] } },
+  { kind: "tool", tool: "chunk", timestamp: "2026-09-16T10:00:07.100+00:00", arguments: { curvature_inv_m: [0], speed_mps: [1] } },
   { kind: "tool", tool: "stop_now", timestamp: "2026-09-16T10:00:08.000+00:00", arguments: {}, outcome: { status: "stopping" } },
   { kind: "segment_end", timestamp: "2026-09-16T10:00:10.000+00:00" },
 ];
@@ -22,6 +24,7 @@ const line = timeline(events);
 assert.equal(line.duration, 10);
 assert.equal(JSON.stringify(line.frames.map((f) => [f.t, f.name[0]])), JSON.stringify([[1.5, "1"], [6, "2"]])); // invalid URL skipped
 assert.equal(JSON.stringify(line.calls.map((c) => [c.t, c.tool])), JSON.stringify([[1.5, "observe"], [3, "set_motion"], [6, "observe"], [8, "stop_now"]]));
+assert.equal(line.plans, 2); // policy chunks are counted, never listed beside chat calls
 assert.equal(latest(line.frames, 1.0), null); // nothing observed yet
 assert.equal(latest(line.frames, 5.9).name[0], "1"); // frames persist until replaced
 assert.equal(latest(line.frames, 6).name[0], "2");

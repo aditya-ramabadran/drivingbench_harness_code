@@ -1,0 +1,4 @@
+[submodule "vendor/openpilot"]
+	path = vendor/openpilot
+	url = https://github.com/commaai/openpilot.git
+	shallow = true

@@ -13,33 +13,46 @@ from drivingbench.gateway.install import (
     install_runtime,
     installation_status,
 )
-from drivingbench.gateway.setup import Config, bring_online, config_path, mirror_recordings
+from drivingbench.gateway.setup import (
+    Config,
+    bring_online,
+    config_path,
+    load_policies,
+    mirror_recordings,
+)
 
 
 def sync(config: Config, root: Path, mirror: Path) -> dict:
-    """The one post-drive command: mirror, publish, attach chats, upload labeled sessions."""
+    """The post-drive command: mirror, publish, attach chats, stage labeled sessions' bulk."""
     mirror = mirror_recordings(config, mirror)
     report = {"mirror": str(mirror), "segments": traces.publish_segments(mirror, root)}
     report["sessions"] = traces.publish_sessions(mirror, root)
     known = traces.recorded_image_hashes(mirror)
+    matches = traces.find_chats_many(
+        {name: root / "segments" / name for name in report["segments"]["published"]},
+        traces.transcript_roots(config),
+    )
     report["chats"] = {
         segment: [
-            {**traces.attach_chat(root, segment, path, client, known), "matched": matches}
-            for client, path, matches in traces.find_chats(
-                root / "segments" / segment, traces.transcript_roots(config)
-            )
+            {**traces.attach_chat(root, segment, path, client, known), "matched": proof}
+            for client, path, proof in found
         ]
-        for segment in traces.segments_without_chat(root)
+        for segment, found in matches.items()
     }
     # Stage every pending session first (the only comma-dependent step), then upload; the comma
     # can leave the network once staging is done.
     staging = mirror.parent / "artifacts"
-    todo = artifacts.pending(root, report["sessions"]["published"]) if config.dataset else []
+    session_ids = set(report["sessions"]["published"])
+    session_ids.update(
+        p.stem
+        for p in (root / "sessions").glob("*.json")
+        if json.loads(p.read_text()).get("labeled_after")
+    )
+    todo = artifacts.pending(root, sorted(session_ids)) if config.dataset else []
+    listing = artifacts.list_routes(config) if todo else ""
     for session in todo:
-        artifacts.stage(config, root, mirror, session, staging)
-    report["staged"] = [
-        session["id"] for session in todo
-    ]  # `drivingbench upload` pushes them, comma-free
+        artifacts.stage(config, root, mirror, session, staging, listing)
+    report["staged"] = [session["id"] for session in todo]  # `upload` pushes them, comma-free
     return report
 
 
@@ -66,17 +79,30 @@ def main(argv=None):
     for operation in ("serve", "online", "status"):
         command = commands.add_parser(operation)
         command.add_argument("--config", type=Path, default=config_path())
+    doctor = commands.add_parser(
+        "doctor", help="Read-only setup checks; never deploys or sends motion"
+    )
+    doctor.add_argument("--config", type=Path, default=config_path())
+    doctor.add_argument(
+        "--network", action="store_true", help="Check HF login and access to the dataset"
+    )
+    doctor.add_argument(
+        "--device", action="store_true", help="Read SSH and existing producer status"
+    )
 
     def traces_args(command):
         command.add_argument("--config", type=Path, default=config_path())
         command.add_argument("--traces", type=Path, default=Path("traces"))
         command.add_argument(
-            "--mirror", type=Path, default=Path("runs/recordings"), help="Ignored full mirror"
+            "--mirror",
+            type=Path,
+            default=Path("runs/recordings"),
+            help="Local copy of the comma's recordings (git-ignored)",
         )
 
     traces_args(
         commands.add_parser(
-            "sync", help="Mirror the comma, publish segments and sessions, attach chats, upload"
+            "sync", help="Mirror the comma, publish closed records, attach chats and stage locally"
         )
     )
     traces_args(
@@ -98,6 +124,7 @@ def main(argv=None):
     end = action.add_parser("end")
     end.add_argument("--outcome", required=True, choices=["completed", "collision", "aborted"])
     end.add_argument("--note", default="")
+    end.add_argument("--attempts", default="", help="one letter per attempt, e.g. FFS")
     end.add_argument("--config", type=Path, default=config_path())
     label = action.add_parser("label", help="Label already published segments after the fact")
     label.add_argument("segments", nargs="+")
@@ -106,6 +133,7 @@ def main(argv=None):
     label.add_argument("--notes", default="")
     label.add_argument("--outcome", required=True, choices=["completed", "collision", "aborted"])
     label.add_argument("--note", default="")
+    label.add_argument("--attempts", default="", help="one letter per attempt, e.g. FFS")
     label.add_argument("--traces", type=Path, default=Path("traces"))
     chat = commands.add_parser(
         "attach-chat",
@@ -158,6 +186,7 @@ def main(argv=None):
                     args.notes,
                     args.outcome,
                     args.note,
+                    args.attempts,
                 ),
                 indent=2,
             )
@@ -169,6 +198,14 @@ def main(argv=None):
         print(build_bundle(args.source.resolve(), args.output, args.settings_file))
         return
     config = Config.load(args.config)
+    if args.operation == "doctor":
+        from drivingbench.gateway.diagnostics import doctor
+
+        report = doctor(
+            config, Path(__file__).resolve().parents[1], network=args.network, device=args.device
+        )
+        print(json.dumps(report, indent=2))
+        return 1 if report["errors"] else 0
     if args.operation == "install":
         from dataclasses import replace
 
@@ -209,12 +246,16 @@ def main(argv=None):
     elif args.operation == "serve":
         import uvicorn
         from drivingbench.gateway.app import create_app
+        from drivingbench.gateway.diagnostics import doctor
 
         app = create_app(
             config.producer_url,
             online=lambda: bring_online(config),
             install_status=lambda: installation_status(paths=config.client_paths),
             repo=Path(config.repo) if config.repo else None,
+            runs=Path(config.runs),
+            policies=load_policies(config.policies),
+            diagnostics=lambda: doctor(config, Path(config.repo) if config.repo else Path.cwd()),
         )
         uvicorn.run(app, host="127.0.0.1", port=config.web_port)
     elif args.operation == "online":
@@ -224,21 +265,18 @@ def main(argv=None):
     elif args.operation == "upload":
         print(
             json.dumps(
-                artifacts.upload(config, args.traces, args.mirror.parent / "artifacts"),
-                indent=2,
+                artifacts.upload(config, args.traces, args.mirror.parent / "artifacts"), indent=2
             )
         )
     elif args.operation == "fetch":
         print(
-            json.dumps(
-                artifacts.fetch(config, args.session, args.traces, args.mirror.parent / "artifacts")
-            )
+            json.dumps(artifacts.fetch(args.session, args.traces, args.mirror.parent / "artifacts"))
         )
     elif args.operation == "session":
         body = (
             {"model": args.model, "harness": args.harness, "notes": args.notes}
             if args.action == "start"
-            else {"outcome": args.outcome, "note": args.note}
+            else {"outcome": args.outcome, "note": args.note, "attempts": args.attempts}
         )
         response = httpx.post(
             f"http://127.0.0.1:{config.web_port}/api/session/{args.action}", json=body, timeout=10

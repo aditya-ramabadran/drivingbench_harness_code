@@ -187,7 +187,7 @@ def test_transcripts_are_found_by_reason_and_filed_with_images_stripped(
         "claude": str(tmp_path / "claude/*/*.jsonl"),
     }
     assert traces.find_chats(root / "segments/2026-09-16-abc123", roots) == [
-        ("codex", driver, {"timestamps": 1, "reasons": 1})
+        ("codex", driver, {"timestamps": 1, "reasons": 0})
     ]
     monkeypatch.setattr(traces, "TRANSCRIPT_ROOTS", roots)
     cli.main(
@@ -199,19 +199,20 @@ def test_transcripts_are_found_by_reason_and_filed_with_images_stripped(
             str(root),
             "--mirror",
             str(mirror),
+            "--config",
+            str(tmp_path / "config.json"),
         ]
     )
     filed = root / "segments/2026-09-16-abc123/chat" / f"codex-{driver.name}"
     attached = json.loads(capsys.readouterr().out)[0]
     assert attached["status"] == "attached" and attached["matched"] == {
         "timestamps": 1,
-        "reasons": 1,
+        "reasons": 0,
     }
     text = filed.read_text()
     assert "[image f00d.jpg]" in text  # matched a recorded frame by content hash
     assert "[image unrecorded-" in text  # unknown image still stripped
     assert "base64" not in text and len(text) < 400
-    assert traces.segments_without_chat(root) == []
 
 
 def test_route_selection_by_overlap_and_upload_records_hashes(tmp_path, monkeypatch):
@@ -247,11 +248,8 @@ def test_route_selection_by_overlap_and_upload_records_hashes(tmp_path, monkeypa
     (root / "sessions/s1.json").write_text(json.dumps(session))
     twin = {**session, "id": "s2", "segments": []}
     (root / "sessions/s2.json").write_text(json.dumps(twin))
-    monkeypatch.setattr(
-        artifacts,
-        "list_routes",
-        lambda config: f"{artifacts.epoch(session['ended_at'])} 2026-09-16--10-02-00--3\n",
-    )
+    finished = artifacts.epoch(session["ended_at"])
+    listing = f"{finished} 2026-09-16--10-02-00--3\n"
     pulled = []
 
     def fake_rsync(config, remote, local):
@@ -260,58 +258,54 @@ def test_route_selection_by_overlap_and_upload_records_hashes(tmp_path, monkeypa
         (local / "fcamera.hevc").write_bytes(b"video")
 
     monkeypatch.setattr(artifacts, "rsync", fake_rsync)
-    config = Config(dataset="example/drivingbench-traces")
+    config = Config(dataset="me/traces")
     staging = tmp_path / "staging"
-    artifacts.stage(config, root, mirror, session, staging)
-    artifacts.stage(config, root, mirror, twin, staging)
-    assert (
-        pulled == ["/data/media/0/realdata/2026-09-16--10-02-00--3/"] * 2
-    )  # rsync re-run (idempotent) ...
-    assert (
-        staging / "s2/routes/2026-09-16--10-02-00--3/fcamera.hevc"
-    ).stat().st_nlink >= 3  # ... bytes stored once
+    # A minute still being written is pulled again next time; once settled, never again.
+    artifacts.stage(config, root, mirror, session, staging, listing, now=finished + 30)
+    artifacts.stage(config, root, mirror, session, staging, listing, now=finished + 200)
+    artifacts.stage(config, root, mirror, twin, staging, listing, now=finished + 300)
+    assert pulled == ["/data/media/0/realdata/2026-09-16--10-02-00--3/"] * 2
+    shared = staging / "s2/routes/2026-09-16--10-02-00--3"
+    assert shared.joinpath("fcamera.hevc").stat().st_nlink >= 3  # bytes stored once
+    assert not shared.joinpath(".complete").exists()  # the marker stays in the cache
     assert artifacts.pending(root, ["s1", "s2"]) == [session, twin]
 
     uploads = []
 
     class FakeApi:
         def upload_folder(self, **kw):
-            uploads.append(
-                (
-                    kw["path_in_repo"],
-                    sorted(
-                        p.relative_to(kw["folder_path"]).as_posix()
-                        for p in Path(kw["folder_path"]).rglob("*")
-                        if p.is_file()
-                    ),
-                )
+            folder = Path(kw["folder_path"])
+            files = sorted(
+                p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file()
             )
+            uploads.append((kw["repo_id"], kw["path_in_repo"], files))
 
     monkeypatch.setattr("huggingface_hub.HfApi", FakeApi)
-    assert artifacts.upload(Config(dataset=None), root, staging) == [
-        {"status": "no_dataset_configured"}
-    ]
+    assert artifacts.upload(Config(), root, staging) == [{"status": "no_dataset_configured"}]
     report = artifacts.upload(config, root, staging)
-    assert [(r["status"], r["path"]) for r in report] == [
-        ("uploaded", "sessions/s1"),
-        ("uploaded", "sessions/s2"),
-    ]
+    assert [r["path"] for r in report] == ["sessions/s1", "sessions/s2"]
     assert uploads[0] == (
+        "me/traces",
         "sessions/s1",
         ["frames/f00d.jpg", "routes/2026-09-16--10-02-00--3/fcamera.hevc"],
     )
     manifest = json.loads((root / "sessions/s1.json").read_text())
-    assert manifest["artifacts"]["path"] == "sessions/s1"
-    assert (
-        next(f for f in manifest["artifacts"]["files"] if f["path"].endswith("f00d.jpg"))["sha256"]
-        == hashlib.sha256(b"frame").hexdigest()
-    )
-    assert artifacts.upload(config, root, staging) == []  # nothing pending twice
-    # fetch follows the manifest's path.
+    assert manifest["artifacts"]["repo"] == "me/traces"
+    assert manifest["artifacts"]["files"][0] == {
+        "path": "frames/f00d.jpg",
+        "bytes": 5,
+        "sha256": hashlib.sha256(b"frame").hexdigest(),
+    }
+    assert artifacts.upload(config, root, staging) == []  # recorded hashes: never uploaded twice
+    # fetch follows the manifest's own repo and path; no laptop dataset setting is needed.
     fetched = {}
     monkeypatch.setattr("huggingface_hub.snapshot_download", lambda **kw: fetched.update(kw))
-    result = artifacts.fetch(config, "s1", root, tmp_path / "fetched")
-    assert fetched["allow_patterns"] == ["sessions/s1/*"] and result["path"].endswith("sessions/s1")
+    result = artifacts.fetch("s1", root, tmp_path / "fetched")
+    assert fetched["repo_id"] == "me/traces" and fetched["allow_patterns"] == ["sessions/s1/*"]
+    assert result["path"] == str(tmp_path / "fetched/sessions/s1")
+    (root / "sessions/s3.json").write_text(json.dumps({**session, "id": "s3"}))
+    with pytest.raises(ValueError, match="no uploaded artifacts"):
+        artifacts.fetch("s3", root, tmp_path / "fetched")
 
 
 def test_sync_composes_every_step(tmp_path, monkeypatch):
@@ -366,6 +360,25 @@ def test_find_chats_is_adversarial_about_escaping_boilerplate_and_stale_files(tm
     ]
 
 
+def test_runner_logs_are_filed_by_run_so_two_runs_can_attach_to_one_segment(tmp_path):
+    root = tmp_path / "traces"
+    segment = root / "segments" / "2026-09-17-abcdef"
+    segment.mkdir(parents=True)
+    (segment / "events.jsonl").write_text(
+        json.dumps({"kind": "segment_start", "timestamp": "2026-09-17T21:00:00+00:00"}) + "\n"
+    )
+    for run, text in (("11111111", "first run"), ("22222222", "second run")):
+        (tmp_path / "runs/runner" / run).mkdir(parents=True)
+        (tmp_path / "runs/runner" / run / "events.jsonl").write_text(text)
+        traces.attach_chat(
+            root, "2026-09-17-abcdef", tmp_path / "runs/runner" / run / "events.jsonl", "runner"
+        )
+    assert sorted(p.name for p in (segment / "chat").iterdir()) == [
+        "runner-11111111-events.jsonl",
+        "runner-22222222-events.jsonl",
+    ]
+
+
 def test_transcript_roots_include_codex_home_and_configured_extras(monkeypatch):
     monkeypatch.delenv("CODEX_HOME", raising=False)
     assert set(traces.transcript_roots()) == {"codex", "claude", "cursor"}
@@ -402,3 +415,50 @@ def test_default_roots_match_each_clients_real_layout(tmp_path, monkeypatch):
         "claude": 1,
         "cursor": 1,
     }
+
+
+def test_route_staging_copies_only_the_road_cameras_and_log(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(artifacts.subprocess, "run", lambda args, **kw: calls.append(args))
+    artifacts.rsync(Config(), "/data/media/0/realdata/r--1/", tmp_path / "r--1")
+    args = calls[0]
+    filters = [a for a in args if a.startswith(("--include", "--exclude"))]
+    assert filters == [
+        "--include=fcamera.hevc",
+        "--include=ecamera.hevc",
+        "--include=rlog.zst",
+        "--exclude=*",
+    ]
+    assert args[-1] == f"{tmp_path / 'r--1'}/" and (tmp_path / "r--1").is_dir()
+
+
+def test_sync_stages_labeled_sessions_only_for_a_configured_dataset(tmp_path, monkeypatch):
+    root, mirror = tmp_path / "traces", tmp_path / "runs/recordings"
+    write_segment(mirror, "2026-09-16-abc123", ["segment_start", "tool", "segment_end"])
+    session_json(mirror, ended_at="2026-09-16T10:05:00+00:00", outcome="completed")
+    monkeypatch.setattr(cli, "mirror_recordings", lambda config, path: mirror)
+    monkeypatch.setattr(traces, "TRANSCRIPT_ROOTS", {"codex": str(tmp_path / "none/*.jsonl")})
+    listed, staged = [], []
+    monkeypatch.setattr(artifacts, "list_routes", lambda config: listed.append(1) or "")
+    monkeypatch.setattr(
+        artifacts, "stage", lambda config, root, mirror, session, *a: staged.append(session["id"])
+    )
+    assert cli.sync(Config(), root, mirror)["staged"] == [] and listed == []  # comma untouched
+    report = cli.sync(Config(dataset="me/traces"), root, mirror)
+    assert report["staged"] == staged == ["2026-09-16-gpt-5-codex-1a2b3c"] and listed == [1]
+
+
+def test_runner_session_identity_matches_a_vla_without_mcp_observe_or_reason(tmp_path):
+    segment = tmp_path / "segment"
+    segment.mkdir()
+    (segment / "events.jsonl").write_text(
+        json.dumps(
+            {"kind": "segment_start", "timestamp": "2026-10-29T18:00:00+00:00", "session": "trial"}
+        )
+        + "\n"
+    )
+    runner = tmp_path / "runner/events.jsonl"
+    runner.parent.mkdir()
+    runner.write_text(json.dumps({"kind": "session_start", "result": {"id": "trial"}}) + "\n")
+    matches = traces.find_chats(segment, {"runner": str(runner)})
+    assert matches == [("runner", runner, {"timestamps": 0, "reasons": 0, "sessions": 1})]

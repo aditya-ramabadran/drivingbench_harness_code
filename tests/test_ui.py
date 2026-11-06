@@ -11,7 +11,7 @@ def test_shared_ui_behavior():
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is required for UI behavior checks")
-    for script in ("ui_behavior.cjs", "trace_viewer_behavior.cjs"):
+    for script in ("ui_behavior.cjs", "trace_viewer_behavior.cjs", "runner_ui_behavior.cjs"):
         result = subprocess.run(
             [node, str(Path(__file__).with_name(script))],
             capture_output=True,

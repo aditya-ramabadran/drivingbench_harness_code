@@ -20,6 +20,7 @@ from drivingbench.shared.contracts import (
     NATIVE_WATCHDOG_S,
     PROTOCOL,
     REASON_MAX_CHARS,
+    Chunk,
     Motion,
     SessionEnd,
     SessionLabel,
@@ -32,7 +33,7 @@ from pydantic import ValidationError
 CAMERA_STALE_S = 3.0  # observe still returns retained frames, but names their age
 
 
-def create_app(state_dir, *, native=None, cameras=None, release="0.1.0"):
+def create_app(state_dir, *, native=None, cameras=None, release="dev"):
     directory = Path(state_dir)
     settings = SettingsStore(directory / "settings.json")
     recording = Recorder(directory / "recordings")
@@ -76,7 +77,7 @@ def create_app(state_dir, *, native=None, cameras=None, release="0.1.0"):
                 native.close()
                 recording.close()
 
-    app = FastAPI(title="DrivingBench Sandbox producer", lifespan=lifespan)
+    app = FastAPI(title="DrivingBench Harness producer", lifespan=lifespan)
     app.state.settings = settings
     app.state.recording = recording
 
@@ -128,7 +129,7 @@ def create_app(state_dir, *, native=None, cameras=None, release="0.1.0"):
             end = SessionEnd.model_validate(body)
         except ValidationError as error:
             raise HTTPException(422, "invalid_session") from error
-        ended = recording.end_session(end.outcome, end.note)
+        ended = recording.end_session(end.outcome, end.note, end.attempts)
         if ended is None:
             raise HTTPException(409, "no_open_session")
         return ended
@@ -146,8 +147,12 @@ def create_app(state_dir, *, native=None, cameras=None, release="0.1.0"):
         body = dict(body)
         request_id = body.pop("request_id", None) or uuid4().hex
         try:
-            motion = Motion.model_validate(body) if operation == "motion" else None
-            if motion is None:
+            commands = {"motion": Motion, "chunk": Chunk}
+            command = commands[operation].model_validate(body) if operation in commands else None
+            if getattr(command, "anchor_s", None) is not None:  # native runs on monotonic time
+                anchor = command.anchor_s + time.monotonic() - camera_clock()
+                command = command.model_copy(update={"anchor_s": anchor})
+            if command is None:
                 # Stop carries at most a recorded reason.
                 note = body.pop("reason", "")
                 if body or not isinstance(note, str) or len(note) > REASON_MAX_CHARS:
@@ -161,14 +166,15 @@ def create_app(state_dir, *, native=None, cameras=None, release="0.1.0"):
             return JSONResponse({"error": "native_unavailable"}, status_code=503)
         if state.get("protocol") != PROTOCOL or not state.get("boot_id"):
             return JSONResponse({"error": "native_unavailable"}, status_code=503)
-        value, revision = settings.snapshot() if operation == "motion" else (None, None)
+        value, revision = settings.snapshot() if command else (None, None)
         envelope = {
             "protocol": PROTOCOL,
             "request_id": request_id,
             "operation": operation,
             "boot_id": state["boot_id"],
             "command_epoch": state["command_epoch"],
-            "motion": motion.model_dump() if motion else None,
+            "motion": command.model_dump() if operation == "motion" else None,
+            "chunk": command.model_dump() if operation == "chunk" else None,
             "settings": value.model_dump() if value is not None else None,
         }
         try:
@@ -181,7 +187,7 @@ def create_app(state_dir, *, native=None, cameras=None, release="0.1.0"):
             result = {"error": "outcome_unknown"}
         recording.record(
             "tool",
-            tool={"motion": "set_motion", "stop": "stop_now"}[operation],
+            tool={"motion": "set_motion", "chunk": "chunk", "stop": "stop_now"}[operation],
             arguments=body,
             outcome=result,
             client=client,
@@ -192,6 +198,10 @@ def create_app(state_dir, *, native=None, cameras=None, release="0.1.0"):
     @app.post("/motion")
     def motion(body: dict, request: Request):
         return execute("motion", body, request.headers.get("X-Client", "operator")[:128])
+
+    @app.post("/chunk")
+    def chunk(body: dict, request: Request):
+        return execute("chunk", body, request.headers.get("X-Client", "operator")[:128])
 
     @app.post("/stop")
     def stop(body: dict, request: Request):
@@ -204,8 +214,7 @@ def create_app(state_dir, *, native=None, cameras=None, release="0.1.0"):
 
     @app.get("/camera/{camera}")
     def camera(camera: str):
-        value, _ = settings.snapshot()
-        frame = frame_for(camera, value.image_adjustments)
+        frame = frame_for(camera, settings.snapshot()[0].image_adjustments)
         if frame is None:
             raise HTTPException(404, "camera_unavailable")
         return Response(
@@ -296,7 +305,7 @@ def main():
     parser.add_argument("--native-socket", default="/data/drivingbench-v01/native.sock")
     parser.add_argument("--port", type=int, default=8876)
     parser.add_argument("--settings-file", type=Path)
-    parser.add_argument("--release", default="0.1.0")
+    parser.add_argument("--release", default="dev")
     args = parser.parse_args()
     target = Path(args.state_dir) / "settings.json"
     if args.settings_file and not target.exists():

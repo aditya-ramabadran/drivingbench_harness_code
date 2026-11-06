@@ -16,6 +16,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -28,10 +30,12 @@ TRANSCRIPT_ROOTS = {
 
 
 def transcript_roots(config=None) -> dict[str, str]:
-    """Default client locations, plus $CODEX_HOME and any extra roots from the laptop config."""
+    """Default client locations, $CODEX_HOME, Runner logs and the laptop config's extra roots."""
     roots = dict(TRANSCRIPT_ROOTS)
     if home := os.environ.get("CODEX_HOME"):
         roots["codex-home"] = f"{home}/sessions/*/*/*/rollout-*.jsonl"
+    if runs := getattr(config, "runs", None):
+        roots["runner"] = f"{runs}/runner/*/events.jsonl"
     roots.update(getattr(config, "extra_transcripts", None) or {})
     return roots
 
@@ -92,14 +96,16 @@ def publish_sessions(mirror: Path, traces: Path) -> dict:
     return {"published": published, "running": running}
 
 
-def label_session(traces: Path, segments: list[str], model, harness, notes, outcome, note=""):
+def label_session(
+    traces: Path, segments: list[str], model, harness, notes, outcome, note="", attempts=""
+):
     """Post-hoc labeling from already published segments, for the forgotten-to-start case."""
     from drivingbench.device.recording import slug
     from drivingbench.shared.contracts import SessionEnd, SessionLabel
 
     label, end = (
         SessionLabel(model=model, harness=harness, notes=notes),
-        SessionEnd(outcome=outcome, note=note),
+        SessionEnd(outcome=outcome, note=note, attempts=attempts),
     )
     times = []
     for segment in segments:
@@ -136,7 +142,7 @@ def chat_keys(segment_folder: Path) -> dict[str, set[str]]:
         if event.get("tool") == "observe" and (event.get("outcome") or {}).get("timestamp"):
             keys["timestamps"].add(event["outcome"]["timestamp"])
         reason = (event.get("arguments") or {}).get("reason", "")
-        if len(reason) >= 12:
+        if event.get("tool") in {"set_motion", "stop_now"} and len(reason) >= 12:
             keys["reasons"].add(reason)
     return keys
 
@@ -146,32 +152,71 @@ def quoted(text: str, key: str) -> bool:
     return key in text or json.dumps(key)[1:-1] in text
 
 
-def find_chats(segment_folder: Path, roots: dict[str, str] | None = None) -> list:
-    """Transcripts that drove this segment, with the evidence: (client, path, matches).
-
-    A file counts with one observe-timestamp hit or two reason hits, so a reused
-    boilerplate reason alone cannot attach the wrong chat. Only transcripts modified
-    after the segment began are read.
-    """
-    keys = chat_keys(segment_folder)
-    events = read_events(segment_folder / "events.jsonl")
-    started = datetime.fromisoformat(events[0]["timestamp"]).timestamp() if events else 0
-    found = []
-    for client, pattern in (roots or transcript_roots()).items() if any(keys.values()) else []:
+def find_chats_many(
+    folders: dict[str, Path], roots: dict[str, str] | None = None
+) -> dict[str, list]:
+    """Scan each candidate transcript once for the whole batch, with recorded match evidence."""
+    facts = {}
+    for name, folder in folders.items():
+        events = read_events(folder / "events.jsonl")
+        facts[name] = {
+            "keys": chat_keys(folder),
+            "started": datetime.fromisoformat(events[0]["timestamp"]).timestamp() if events else 0,
+            "sessions": {e["session"] for e in events if e.get("session")},
+        }
+    found = {name: [] for name in folders}
+    for client, pattern in (roots or transcript_roots()).items():
         for name in sorted(glob.glob(os.path.expanduser(pattern))):
             path = Path(name)
             try:
-                if path.stat().st_mtime < started:
+                modified = path.stat().st_mtime
+                candidates = {
+                    name: fact
+                    for name, fact in facts.items()
+                    if modified >= fact["started"]
+                    and (any(fact["keys"].values()) or (client == "runner" and fact["sessions"]))
+                }
+                if not candidates:
                     continue
-                text = path.read_text(errors="replace")
+                evidence = {name: {"timestamps": set(), "reasons": set()} for name in candidates}
+                # App histories can be gigabytes. Read bounded JSONL records, and stop once
+                # this file establishes every candidate match; do not load the whole history.
+                with path.open(errors="replace") as stream:
+                    for line in stream:
+                        session_id = None
+                        if client == "runner":
+                            try:
+                                event = json.loads(line)
+                                if event.get("kind") == "session_start":
+                                    session_id = (event.get("result") or {}).get("id")
+                            except ValueError:
+                                pass
+                        for segment, fact in list(candidates.items()):
+                            seen = evidence[segment]
+                            for kind, values in fact["keys"].items():
+                                seen[kind].update(
+                                    key for key in values - seen[kind] if quoted(line, key)
+                                )
+                            matches = {kind: len(values) for kind, values in seen.items()}
+                            if session_id and session_id in fact["sessions"]:
+                                matches["sessions"] = 1
+                            if (
+                                matches["timestamps"] >= 1
+                                or matches["reasons"] >= 2
+                                or matches.get("sessions")
+                            ):
+                                found[segment].append((client, path, matches))
+                                del candidates[segment]
+                        if not candidates:
+                            break
             except OSError:
                 continue
-            matches = {
-                kind: sum(quoted(text, key) for key in values) for kind, values in keys.items()
-            }
-            if matches["timestamps"] >= 1 or matches["reasons"] >= 2:
-                found.append((client, path, matches))
     return found
+
+
+def find_chats(segment_folder: Path, roots: dict[str, str] | None = None) -> list:
+    """One exact observe timestamp, two reasons, or a Runner's recorded session ID."""
+    return find_chats_many({segment_folder.name: segment_folder}, roots)[segment_folder.name]
 
 
 BASE64_IMAGE = re.compile(r"(?:data:image/[a-z]+;base64,)?([A-Za-z0-9+/]{800,}={0,2})")
@@ -205,21 +250,37 @@ def attach_chat(traces: Path, segment: str, transcript: Path, client: str, known
     if not (folder / "events.jsonl").is_file():
         raise ValueError(f"{segment} is not a published segment under {traces}")
     transcript = transcript.expanduser().resolve()
-    content = strip_images(transcript.read_text(errors="replace"), known or {}).encode()
-    destination = folder / "chat" / f"{client}-{transcript.name}"
-    if destination.exists():
-        if destination.read_bytes() == content:
-            return {"status": "unchanged", "chat": str(destination)}
-        raise ValueError(f"{destination} exists with different content; choose another name")
-    destination.parent.mkdir(exist_ok=True)
-    destination.write_bytes(content)
+    # Bound the snapshot at the initial file length; a live conversation may append later.
+    digest = hashlib.sha256()
+    with tempfile.TemporaryFile() as content:
+        with transcript.open("rb") as source:
+            remaining = transcript.stat().st_size
+            while remaining:
+                line = source.readline(remaining)
+                if not line:
+                    raise ValueError(f"Transcript truncated during snapshot: {transcript}")
+                remaining -= len(line)
+                encoded = strip_images(line.decode(errors="replace"), known or {}).encode()
+                digest.update(encoded)
+                content.write(encoded)
+        name = (
+            f"{transcript.parent.name}-{transcript.name}" if client == "runner" else transcript.name
+        )
+        destination = folder / "chat" / f"{client}-{name}"
+        if destination.exists():
+            with destination.open("rb") as existing:
+                if hashlib.file_digest(existing, "sha256").digest() == digest.digest():
+                    return {"status": "unchanged", "chat": str(destination)}
+            destination = destination.with_name(
+                f"{destination.stem}-{digest.hexdigest()[:16]}{destination.suffix}"
+            )
+            if destination.exists():
+                with destination.open("rb") as existing:
+                    if hashlib.file_digest(existing, "sha256").digest() != digest.digest():
+                        raise ValueError(f"Transcript snapshot hash collision: {destination}")
+                return {"status": "unchanged", "chat": str(destination)}
+        destination.parent.mkdir(exist_ok=True)
+        content.seek(0)
+        with destination.open("xb") as target:
+            shutil.copyfileobj(content, target)
     return {"status": "attached", "chat": str(destination)}
-
-
-def segments_without_chat(traces: Path) -> list[str]:
-    root = traces / "segments"
-    return [
-        folder.name
-        for folder in (sorted(root.iterdir()) if root.is_dir() else [])
-        if (folder / "events.jsonl").is_file() and not any((folder / "chat").glob("*"))
-    ]

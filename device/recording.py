@@ -15,6 +15,7 @@ Layout under the recordings directory:
     current-segment, current-session  markers while open
 """
 
+import functools
 import io
 import json
 import queue
@@ -26,7 +27,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-SEGMENT_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}-[0-9a-f]{6}$")
 THUMB_WIDTH = 320
 
 
@@ -52,11 +52,23 @@ def thumbnail(jpeg):
         return out.getvalue()
 
 
+def locked(method):
+    """Segment and session transitions run whole, so request and heartbeat threads never
+    see a session closed halfway through an event."""
+
+    @functools.wraps(method)
+    def run(self, *args, **kwargs):
+        with self.lock:
+            return method(self, *args, **kwargs)
+
+    return run
+
+
 class Recorder:
     def __init__(self, directory):
         self.directory = Path(directory)
         self.calls = deque(maxlen=200)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.queue = queue.Queue(maxsize=2048)
         self.error = None
         self.segment = None
@@ -82,6 +94,7 @@ class Recorder:
 
     # Segments -------------------------------------------------------------------------
 
+    @locked
     def begin_segment(self, **data):
         if self.segment is not None:
             return self.segment
@@ -93,6 +106,7 @@ class Recorder:
         self.record("segment_start", **data)
         return self.segment
 
+    @locked
     def end_segment(self, reason, **data):
         if self.segment is None:
             return
@@ -102,6 +116,7 @@ class Recorder:
 
     # Labeled sessions -----------------------------------------------------------------
 
+    @locked
     def begin_session(self, model, harness, notes=""):
         if self.session is not None:
             self.end_session("superseded")
@@ -115,6 +130,7 @@ class Recorder:
             "ended_at": None,
             "outcome": None,
             "note": "",
+            "attempts": "",
             "segments": [self.segment] if self.segment else [],
         }
         self._save_session()
@@ -122,11 +138,12 @@ class Recorder:
         self.record("session_start", **{k: v for k, v in self.session.items() if k != "segments"})
         return dict(self.session)
 
-    def end_session(self, outcome, note=""):
+    @locked
+    def end_session(self, outcome, note="", attempts=""):
         if self.session is None:
             return None
-        self.session.update(ended_at=now_iso(), outcome=outcome, note=note)
-        self.record("session_end", outcome=outcome, note=note)
+        self.session.update(ended_at=now_iso(), outcome=outcome, note=note, attempts=attempts)
+        self.record("session_end", outcome=outcome, note=note, attempts=attempts)
         self._save_session()
         self._enqueue(("marker", ("current-session", None)))
         ended, self.session = self.session, None
@@ -137,6 +154,7 @@ class Recorder:
 
     # Events and images ----------------------------------------------------------------
 
+    @locked
     def record(self, kind, **data):
         event = {
             "id": uuid4().hex,
@@ -147,8 +165,7 @@ class Recorder:
             **data,
         }
         if kind == "tool":
-            with self.lock:
-                self.calls.append(event)
+            self.calls.append(event)
         self._enqueue(("event", event))
         return event
 

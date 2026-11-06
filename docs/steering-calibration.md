@@ -1,15 +1,15 @@
 # Steering scale calibration
 
 `steering_percent` is a percent of one shared setting, the **steering scale**:
-steering-wheel degrees at 100% (`max_steering_angle_deg`, default 180). The
-default was measured on a Toyota Corolla: at 0.5–1.3 m/s the EPS reached
-~120–130° regardless of demand, so 180 spans that range with headroom.
-Recalibrate for your car, and whenever speed or hardware changes what it
-delivers. Everything below is in steering-wheel degrees; tire angle never
-appears (a Corolla's ratio is about 18:1).
+steering-wheel degrees at 100% (`max_steering_angle_deg`, default 340, the Tesla
+Model 3's: [tesla.md](tesla.md)). A Toyota Corolla uses 180: at 0.5–1.3 m/s its EPS
+reached ~120–130° regardless of demand. The default seeds only a comma with no saved
+settings; one that has driven keeps its saved scale. Recalibrate for your car, and
+whenever speed or hardware changes what it delivers. Everything below is in
+steering-wheel degrees; tire angle never appears (a Corolla's ratio is about 18:1).
 
-Goal: 100% means the most steering openpilot + the Toyota EPS will actually
-deliver at sandbox speeds, so no part of the model's range is dead.
+Goal: 100% means the most steering openpilot and the car's EPS will actually
+deliver at harness speeds, so no part of the model's range is dead.
 
 ## 1. Mechanical lock (reference)
 
@@ -19,8 +19,9 @@ magnitudes; the smaller is mechanical lock, typically around 480° for a compact
 
 ## 2. Achievable angle under openpilot
 
-Open space, operator on the brake, scale temporarily raised (say 720) so the
-request is not the limit. SET, and from any chat:
+Open space, operator on the brake, scale temporarily raised (say 720; a Tesla's EPAS
+faults above 360, so stay at 360 there) so the request is not the limit. Engage, and
+from any chat:
 
 ```python
 set_motion(
@@ -33,26 +34,30 @@ set_motion(
 ```
 
 Watch **Steering (positive left)** on the Drive tab and note the plateau in
-degrees (the chat's `observe` shows only percent of the current scale). The final angle is requested immediately; native limits govern how quickly the wheel responds. `stop_now`,
-repeat for `right`, then disengage native control.
+degrees (the chat's `observe` shows only percent of the current scale). The final
+angle is requested immediately; native limits govern how quickly the wheel responds.
+`stop_now`, repeat for `right`, then disengage native control.
 
 ## 3. Save
 
 Take the smaller of the two plateau magnitudes. If it is within ~10% of
 mechanical lock, either number is fine; use the lock. Otherwise use the plateau:
 rack force falls with speed, so an angle reachable at 0.6 m/s is reachable at
-every sandbox speed, and 100% never asks for more than the car gives.
+every harness speed, and 100% never asks for more than the car gives.
 
 Enter it as the steering scale in Setup and save. It applies to the next command
 on every laptop; no redeploy. Put the two numbers in the commit message when you
 commit the session's trace; the settings revision is in `events.jsonl`.
 
-Below about 560° the generic openpilot curvature cap (0.2/m) does not bind at
-low speed; the `clip_curvature` native change only matters above that.
+The generic openpilot curvature cap (0.2/m) binds at low speed only above about
+560° on a Corolla (about 395° on a Model 3, beyond its EPAS limit); the
+`clip_curvature` native change matters only above that.
 
 ## Reading a steering plateau
 
-Use the synchronized fields in the session's `telemetry` events:
+Use the synchronized fields in the session's `telemetry` events. On an angle-steered
+Tesla, compare `requested_angle_deg`, `applied_angle_deg` and the measured steering. On a
+torque-steered Toyota:
 
 - `requested_torque_normalized` near ±1 means the lateral controller is asking
   for its full configured authority.

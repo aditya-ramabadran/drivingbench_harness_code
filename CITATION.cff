@@ -1,11 +1,12 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-title: "DrivingBench Harness: a steering-command harness for benchmarking language models in a real car"
+title: "DrivingBench Harness: a steering-command harness for benchmarking AI models in a real car"
 type: software
-version: "1.0"
-date-released: 2026-09-17
+version: "1.1"
+date-released: 2026-11-06
 license: MIT
-repository-code: "https://github.com/aditya-ramabadran/drivingbench_harness_v1"
+repository-code: "https://github.com/aditya-ramabadran/drivingbench_harness_code"
+url: "https://drivingbench.com"
 authors:
   - family-names: Ramabadran
     given-names: Aditya

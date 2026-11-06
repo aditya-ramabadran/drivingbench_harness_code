@@ -23,10 +23,13 @@ from drivingbench.device.cameras import Cameras, Frame, camera_clock
 from drivingbench.device.ipc import NativeClient, NativeServer
 from drivingbench.device.service import create_app as producer_app
 from drivingbench.gateway.app import create_app as gateway_app
+from drivingbench.shared.contracts import STEERING_SCALE_DEG
 from mcp.client.stdio import stdio_client
 from PIL import Image
 
 from mcp import ClientSession, StdioServerParameters
+
+QUARTER = STEERING_SCALE_DEG / 4  # degrees at 25% on the default scale
 
 
 class MemoryCameras(Cameras):
@@ -174,7 +177,7 @@ async def test_two_real_mcp_processes_share_native_commands_and_hot_settings(tmp
                 command = dict(direction="left", steering_percent=50, speed_mps=0.6, duration_s=5)
                 assert summary(await codex.call_tool("set_motion", command))["status"] == "accepted"
                 first = await wait_status(ui, lambda state: state.get("command") is not None)
-                assert first["command"]["target_angle_deg"] == 90
+                assert first["command"]["target_angle_deg"] == 2 * QUARTER
                 repeated = await ui.post(
                     "/api/motion",
                     json=command,
@@ -197,7 +200,8 @@ async def test_two_real_mcp_processes_share_native_commands_and_hot_settings(tmp
                     == "accepted"
                 )
                 second = await wait_status(
-                    ui, lambda state: (state.get("command") or {}).get("target_angle_deg") == -45
+                    ui,
+                    lambda state: (state.get("command") or {}).get("target_angle_deg") == -QUARTER,
                 )
                 assert second["command"]["request_id"] != first["command"]["request_id"]
                 assert second["command_epoch"] == first["command_epoch"]
@@ -207,7 +211,7 @@ async def test_two_real_mcp_processes_share_native_commands_and_hot_settings(tmp
                 )
                 assert configured.status_code == 200
                 unchanged = (await ui.get("/api/status")).json()
-                assert unchanged["command"]["target_angle_deg"] == -45
+                assert unchanged["command"]["target_angle_deg"] == -QUARTER
                 rejected = summary(
                     await codex.call_tool("set_motion", command | {"speed_mps": 1.0})
                 )

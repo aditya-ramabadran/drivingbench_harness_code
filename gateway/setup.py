@@ -17,6 +17,14 @@ def config_path() -> Path:
     return Path.home() / ".config/drivingbench-v01/config.json"
 
 
+def load_policies(path) -> dict:
+    """The operator's trained-policy registry (docs/runner.md); empty while the file is absent."""
+    from drivingbench.harness.vla import REGISTRY
+
+    path = Path(path).expanduser()
+    return REGISTRY.validate_json(path.read_bytes()) if path.is_file() else {}
+
+
 @dataclass(frozen=True)
 class Config:
     ssh_host: str = "comma"
@@ -26,9 +34,13 @@ class Config:
     tunnel_port: int = 8877
     web_port: int = 8766
     device_root: str = "/data/drivingbench-v01"
-    # Shared Hugging Face dataset for labeled-session artifacts; None disables uploads.
+    # The operator's Hugging Face dataset for labeled-session artifacts; None disables uploads.
     dataset: str | None = None
     repo: str | None = None  # checkout whose traces/ the viewer reads; set by install
+    # Runner logs and evaluation markers, outside the checkout launchd may not write.
+    runs: str = str(Path.home() / ".local/share/drivingbench-v01/runs")
+    # The operator's trained policies for the Runner, name -> endpoint (docs/runner.md).
+    policies: str = str(Path.home() / ".config/drivingbench-v01/policies.json")
     # Extra transcript locations, label -> glob (e.g. a second Codex home).
     extra_transcripts: dict[str, str] = field(default_factory=dict)
     client_configs: dict[str, str] = field(default_factory=dict)

@@ -7,6 +7,9 @@ from dataclasses import asdict, dataclass
 
 from drivingbench.controller.speed import SpeedControl
 from drivingbench.shared.contracts import (
+    ANCHORED_LEASE_S,
+    CHUNK_MAX_STEPS,
+    CHUNK_STEP_S,
     EMERGENCY_SPEED_MPS,
     NATIVE_WATCHDOG_S,
     PROTOCOL,
@@ -15,11 +18,16 @@ from drivingbench.shared.contracts import (
 )
 from pydantic import ValidationError
 
+# A wheel held this long is the driver's; Tesla's stock hands-on rule. A wheel stopping hard at a
+# full-lock target jolts the column past openpilot's 1 Nm threshold for about 50 ms.
+STEERING_OVERRIDE_S = 0.25
+
 
 @dataclass
 class Sample:
     speed_mps: float = 0.0
     steering_deg: float = 0.0
+    curvature_inv_m: float = 0.0  # of steering_deg (contracts.curvature)
     gear: str = "unknown"
     brake_pressed: bool = False
     gas_pressed: bool = False
@@ -51,6 +59,7 @@ class Selection:
     acceleration_mps2: float = 0.0
     should_stop: bool = True
     resume: bool = False
+    curvature_inv_m: float | None = None  # a chunk's target; native converts it, not this
 
 
 class Controller:
@@ -66,6 +75,7 @@ class Controller:
         self.last_tick = None
         self.reason = None
         self.overspeed_since = None
+        self.steering_pressed_since = None
         self.receipts = OrderedDict()
 
     def cancel(self, reason=None):
@@ -76,13 +86,16 @@ class Controller:
         self.speed.reset()
         self.reason = reason
 
-    def motion_block(self, now, settings=None):
+    def motion_block(self, now):
         sample = self.sample
         if self.last_heartbeat is None or now - self.last_heartbeat > NATIVE_WATCHDOG_S:
             return "producer_unavailable"
         if sample.gear != "drive":
             return "gear_not_drive"
-        if sample.gas_pressed or sample.steering_pressed:
+        held_wheel = self.steering_pressed_since is not None and (
+            now - self.steering_pressed_since >= STEERING_OVERRIDE_S
+        )
+        if sample.gas_pressed or held_wheel:
             return "operator_intervention"
         if sample.brake_pressed:
             return "operator_brake"
@@ -109,6 +122,10 @@ class Controller:
                 self.overspeed_since = now
         else:
             self.overspeed_since = None
+        if not sample.steering_pressed:
+            self.steering_pressed_since = None
+        elif self.steering_pressed_since is None:
+            self.steering_pressed_since = now
         if reason := self.motion_block(now):
             self.cancel(reason)
         elif self.command is None:
@@ -139,7 +156,7 @@ class Controller:
 
     def _apply(self, request, now):
         if request.boot_id != self.boot_id or (
-            request.operation == "motion" and request.command_epoch != self.command_epoch
+            request.operation != "stop" and request.command_epoch != self.command_epoch
         ):
             return self.reply(status="rejected", reason="command_epoch_changed")
         if request.operation == "stop":
@@ -147,26 +164,52 @@ class Controller:
         elif request.operation == "motion":
             if request.motion is None or request.settings is None:
                 return self.reply(status="rejected", reason="malformed_request")
-            if reason := self.motion_block(now, request.settings):
+            if reason := self.motion_block(now):
                 return self.reply(status="rejected", reason=reason)
             motion, settings = request.motion, request.settings
             sign = {"left": 1, "right": -1, "straight": 0}[motion.direction]
             angle = sign * motion.steering_percent / 100 * settings.max_steering_angle_deg
             if motion.speed_mps > settings.speed_limit_mps:
                 return self.reply(status="rejected", reason="speed_limit_exceeded")
-            speed = motion.speed_mps
             self.command = dict(
                 request_id=request.request_id,
                 accepted_at_s=now,
                 expires_at_s=now + motion.duration_s,
                 target_angle_deg=angle,
-                speed_mps=speed,
+                speed_mps=motion.speed_mps,
             )
-            if self.settings.speed_control != settings.speed_control:
-                self.speed = SpeedControl(settings.speed_control)
-            self.settings = settings
-            self.reason = None
+            self.accept(settings)
+        elif request.operation == "chunk":
+            if request.chunk is None or request.settings is None:
+                return self.reply(status="rejected", reason="malformed_request")
+            if reason := self.motion_block(now):
+                return self.reply(status="rejected", reason=reason)
+            chunk, settings = request.chunk, request.settings
+            if max(chunk.speed_mps) > settings.speed_limit_mps:
+                return self.reply(status="rejected", reason="speed_limit_exceeded")
+            end = len(chunk.speed_mps) * CHUNK_STEP_S
+            if chunk.anchor_s is not None:  # its own end, after the lease, within the longest chunk
+                end = min(
+                    max(ANCHORED_LEASE_S, chunk.anchor_s + end - now),
+                    CHUNK_MAX_STEPS * CHUNK_STEP_S,
+                )
+            self.command = dict(
+                request_id=request.request_id,
+                accepted_at_s=now,
+                expires_at_s=now + end,
+                setpoints=list(zip(chunk.curvature_inv_m, chunk.speed_mps)),
+                anchor_s=chunk.anchor_s,
+                curvature_inv_m=chunk.curvature_inv_m[0],
+                speed_mps=chunk.speed_mps[0],
+            )
+            self.accept(settings)
         return self.reply(status="accepted")
+
+    def accept(self, settings):
+        if self.settings.speed_control != settings.speed_control:
+            self.speed = SpeedControl(settings.speed_control)
+        self.settings = settings
+        self.reason = None
 
     def step(self, now):
         sample = self.sample
@@ -186,13 +229,31 @@ class Controller:
             self.speed.reset()
             self.issued_angle = sample.steering_deg if math.isfinite(sample.steering_deg) else 0.0
             return Selection(self.issued_angle)
+        if "setpoints" in command:
+            return self.chunk_step(command, now, dt)
         self.issued_angle = (
             command["target_angle_deg"] if sample.lateral_active else sample.steering_deg
         )
-        acceleration = self.speed.step(
-            command["speed_mps"], sample.speed_mps, max(dt, 1e-6), command["accepted_at_s"]
-        )
+        acceleration = self.speed.step(command["speed_mps"], sample.speed_mps, max(dt, 1e-6))
         return Selection(self.issued_angle, acceleration, False, True)
+
+    def chunk_step(self, command, now, dt):
+        """The setpoint for this moment; a 0 m/s setpoint brakes and holds without ending it."""
+        tick = int((now - command["accepted_at_s"]) / CHUNK_STEP_S)
+        last = len(command["setpoints"]) - 1
+        if command["anchor_s"] is None:
+            step = min(tick, last)
+        else:
+            due = command["accepted_at_s"] + tick * CHUNK_STEP_S
+            step = min(max(round((due - command["anchor_s"]) / CHUNK_STEP_S), 0), last)
+        curvature, speed = command["setpoints"][step]
+        command.update(curvature_inv_m=curvature, speed_mps=speed)
+        self.issued_angle = self.sample.steering_deg  # native records the converted angle
+        if speed == 0:
+            self.speed.reset()
+            return Selection(self.issued_angle, curvature_inv_m=curvature)
+        acceleration = self.speed.step(speed, self.sample.speed_mps, max(dt, 1e-6))
+        return Selection(self.issued_angle, acceleration, False, True, curvature)
 
     def applied_angle(self, angle):
         """Record the final native-limited angle for telemetry."""
@@ -216,7 +277,7 @@ class Controller:
             elif not s.lateral_active:
                 reason = "steering_unavailable"
         fields = asdict(s)
-        for name in ("speed_mps", "steering_deg"):
+        for name in ("speed_mps", "steering_deg", "curvature_inv_m"):
             if not math.isfinite(fields[name]):
                 fields[name] = None
         return self.reply(

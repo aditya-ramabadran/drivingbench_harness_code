@@ -1,11 +1,11 @@
 """Build a versioned bundle; activate it on a parked comma with checked native edits.
 
 Run ``drivingbench bundle`` on the laptop: it stages the complete aarch64 Python
-tree, the modified openpilot files from ``native/`` with their upstream digests,
-the reviewed settings and this script. Copy and extract that archive on the
-comma, then run its activate.py with the native Python. Restart openpilot after
-activation; Bring online only starts the installed producer. See
-docs/deployment.md.
+tree, the modified openpilot files from ``native/`` with the digests of their stock
+versions in the ``vendor/openpilot`` submodule, the reviewed settings and this script.
+Copy and extract that archive on the comma, then run its activate.py with the
+native Python. Restart openpilot after activation; Bring online only starts the
+installed producer. See docs/deployment.md.
 """
 
 import argparse
@@ -22,9 +22,12 @@ import tempfile
 import time
 from pathlib import Path
 
-# native/upstream/ holds the stock openpilot files at the pinned commit and
-# native/drivingbench/ the modified versions; docs/deployment.md records the changes.
-NATIVE = Path("native")
+# Every openpilot file DrivingBench modifies: the modified copy is native/<name>, the stock one
+# vendor/openpilot/<name> (the pinned upstream submodule). docs/deployment.md records the changes.
+NATIVE_FILES = (
+    "openpilot/selfdrive/controls/controlsd.py",
+    "openpilot/selfdrive/controls/lib/drive_helpers.py",
+)
 # comma four: aarch64 Linux, /usr/local/venv/bin/python 3.12.
 DEVICE_PLATFORM = [
     "--python-platform",
@@ -41,17 +44,25 @@ def digest(data):
 
 
 def build_bundle(repo: Path, output: Path, settings_file: Path) -> Path:
-    from drivingbench.shared.contracts import Settings, SpeedSettings
+    from drivingbench.shared.contracts import PROTOCOL, Settings, SpeedSettings
 
     settings = json.loads(settings_file.read_text())
     value = settings.get("settings", settings)
     if set(value.get("speed_control", {})) != set(SpeedSettings.model_fields):
         raise ValueError("Settings must explicitly include all deployed speed_control coefficients")
     Settings.model_validate(value)
+    missing = [name for name in NATIVE_FILES if not (repo / "vendor/openpilot" / name).is_file()]
+    if missing:
+        raise ValueError(
+            f"Stock openpilot missing: vendor/openpilot/{missing[0]}; "
+            "run git submodule update --init vendor/openpilot"
+        )
     dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True)
     if dirty.strip():
         raise ValueError("Commit the release before bundling; source checkout must be clean")
-    release = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    release, upstream = subprocess.check_output(
+        ["git", "rev-parse", "HEAD", "HEAD:vendor/openpilot"], cwd=repo, text=True
+    ).split()
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
@@ -87,11 +98,10 @@ def build_bundle(repo: Path, output: Path, settings_file: Path) -> Path:
         (wheel,) = wheels.glob("*.whl")
         subprocess.run(target + ["--no-deps", str(wheel)], cwd=repo, check=True)
         native = stage / "native"
-        upstream = json.loads((repo / NATIVE / "upstream.json").read_text())
-        manifest = {"release": release, "protocol": 2, "upstream": upstream["commit"], "native": {}}
-        for name in upstream["files"]:
-            original = (repo / NATIVE / "upstream" / name).read_bytes()
-            content = (repo / NATIVE / "drivingbench" / name).read_bytes()
+        manifest = {"release": release, "protocol": PROTOCOL, "upstream": upstream, "native": {}}
+        for name in NATIVE_FILES:
+            original = (repo / "vendor/openpilot" / name).read_bytes()
+            content = (repo / "native" / name).read_bytes()
             destination = native / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(content)
@@ -205,10 +215,10 @@ def stop_previous_producer(root: Path, previous: Path | None):
 
 
 def require_free_port(port: int, timeout: float = 10.0):
-    """The retired field producer also used 8876; never race it for the port.
+    """Never race another listener for the producer port.
 
-    A just-stopped producer's forked camera workers hold its listening socket for a
-    moment after it exits, so the port is given a little time to clear.
+    A just-stopped producer's camera workers hold its listening socket for a moment
+    after it exits, so the port is given a little time to clear.
     """
     import socket
 
@@ -287,7 +297,24 @@ def stage_release(bundle, release, checks):
         shutil.rmtree(partial, ignore_errors=True)
 
 
-def activate(bundle: Path, root: Path, native_root: Path, python: Path, port: int = 8876):
+def disable_updates(native_root: Path):
+    """The native edits target one openpilot build; the updater must never replace it."""
+    import sys
+
+    sys.path.insert(0, str(native_root))
+    from openpilot.common.params import Params
+
+    Params().put_bool("DisableUpdates", True)
+
+
+def activate(
+    bundle: Path,
+    root: Path,
+    native_root: Path,
+    python: Path,
+    port: int = 8876,
+    fingerprint: str | None = None,
+):
     if not root.is_absolute() or root.parent == Path("/"):
         raise ValueError("Choose an absolute dedicated release directory")
     if not (bundle / "python/drivingbench/device/service.py").is_file():
@@ -306,6 +333,7 @@ def activate(bundle: Path, root: Path, native_root: Path, python: Path, port: in
 
     stage_release(bundle, release, checks)
     smoke_imports(python, release, native_root)
+    disable_updates(native_root)
     environment = native_root / "launch_env.sh"
     original = environment.read_bytes()
     backup = release / "native-backup"
@@ -316,14 +344,19 @@ def activate(bundle: Path, root: Path, native_root: Path, python: Path, port: in
             shutil.copy2(native_root / name, destination)
         (backup / "launch_env.sh").write_bytes(original)
     exports = (
-        f"\n# DrivingBench v0.1 release {manifest['release']}\n"
+        f"\n# DrivingBench release {manifest['release']}\n"
         f"export DRIVINGBENCH_MODE=experimental\n"
         f"export DRIVINGBENCH_PYTHON_ROOT={shlex.quote(str(release / 'python'))}\n"
         f"export DRIVINGBENCH_NATIVE_SOCKET={shlex.quote(str(root / 'native.sock'))}\n"
     )
-    # Replace retired exports, including the now-unconditional DM setting.
+    if fingerprint:  # opendbc's own override: skips recognition when a car update breaks it
+        exports += f"export FINGERPRINT={shlex.quote(fingerprint)}\n"
+    # Replace this block from any earlier release.
     cleaned = re.sub(
-        rb"^(# DrivingBench[^\n]*|export DRIVINGBENCH_[^\n]*)\n", b"", original, flags=re.M
+        rb"^(# DrivingBench[^\n]*|export (DRIVINGBENCH_|FINGERPRINT=)[^\n]*)\n",
+        b"",
+        original,
+        flags=re.M,
     )
     cleaned = cleaned.rstrip(b"\n") + b"\n" if cleaned.strip() else b""
     command = [
@@ -399,10 +432,10 @@ if __name__ == "__main__":
     parser.add_argument("--root", type=Path, default=Path("/data/drivingbench-v01"))
     parser.add_argument("--native-root", type=Path, default=Path("/data/openpilot"))
     parser.add_argument("--python", type=Path, default=Path("/usr/local/venv/bin/python"))
+    parser.add_argument("--fingerprint", help="pin the car, e.g. TESLA_MODEL_3")
     args = parser.parse_args()
-    print(
-        json.dumps(
-            activate(Path(__file__).resolve().parent, args.root, args.native_root, args.python),
-            indent=2,
-        )
+    bundle = Path(__file__).resolve().parent
+    result = activate(
+        bundle, args.root, args.native_root, args.python, fingerprint=args.fingerprint
     )
+    print(json.dumps(result, indent=2))

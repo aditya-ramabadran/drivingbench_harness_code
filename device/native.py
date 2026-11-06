@@ -5,6 +5,7 @@ import os
 import time
 
 from drivingbench.controller.core import Controller, Sample, Selection
+from drivingbench.shared.contracts import curvature, wheel_angle
 
 
 def finite(value):
@@ -12,18 +13,41 @@ def finite(value):
     return value if math.isfinite(value) else None
 
 
+def unsupported(cp) -> str | None:
+    """Why this car cannot run DrivingBench, or None: Toyota torque or Tesla angle steering,
+    each with openpilot controlling speed (Tesla's is the alpha longitudinal option)."""
+    steering = {
+        "toyota": cp.lateralTuning.which() == "torque",
+        "tesla": str(cp.steerControlType) == "angle",
+    }
+    if not steering.get(cp.brand):
+        return (
+            f"unsupported_vehicle: {cp.carFingerprint} needs Toyota torque or Tesla angle steering"
+        )
+    if not cp.openpilotLongitudinalControl:
+        hint = "; enable AlphaLongitudinalEnabled" if cp.brand == "tesla" else ""
+        return (
+            f"unsupported_vehicle: {cp.carFingerprint} lacks openpilot longitudinal control{hint}"
+        )
+    return None
+
+
 class Bridge:
-    def __init__(self, server, clock=time.monotonic):
+    def __init__(self, server, clock=time.monotonic, vehicle=None, failure=None, wheelbase=None):
         self.server = server
+        self.wheelbase = wheelbase
         self.clock = clock
         self.controller = Controller()
         self.selection = Selection(0.0)
-        self.failure = None
+        self.failure = failure
         # Recorder evidence only. None means the source was invalid or has not reported yet.
         self.evidence = {
+            "vehicle": vehicle,
             "steering_raw_deg": None,
             "issued_curvature": None,
             "curvature_limited": None,
+            "requested_angle_deg": None,
+            "applied_angle_deg": None,
             "requested_torque_normalized": None,
             "applied_torque_normalized": None,
             "applied_torque_can": None,
@@ -44,22 +68,18 @@ class Bridge:
 
         if os.environ.get("DRIVINGBENCH_MODE") != "experimental":
             raise ValueError("DrivingBench mode must be stock or experimental")
-        if (
-            cp.brand != "toyota"
-            or not cp.openpilotLongitudinalControl
-            or cp.lateralTuning.which() != "torque"
-        ):
-            raise ValueError(
-                "Sandbox requires Toyota native longitudinal and torque lateral control"
-            )
+        # An unsupported car latches a failure the producer reports, never stock driving.
         return cls(
             NativeServer(
                 os.environ.get("DRIVINGBENCH_NATIVE_SOCKET", "/data/drivingbench-v01/native.sock")
             ),
+            vehicle=str(cp.carFingerprint),
+            failure=unsupported(cp),
+            wheelbase=float(cp.wheelbase),
         )
 
     def tick(self, sm, *, lateral_active, longitudinal_active):
-        """Never fall through to the stock planner after a Sandbox failure."""
+        """Never fall through to the stock planner after a DrivingBench failure."""
         cs, lp, state = sm["carState"], sm["vehicleParameters"], sm["selfdriveState"]
         now = self.clock()
         measured = cs.steeringAngleDeg - lp.angleOffsetDeg
@@ -80,6 +100,11 @@ class Bridge:
             sample = Sample(
                 speed_mps=float(cs.vEgo),
                 steering_deg=float(measured),
+                curvature_inv_m=(
+                    float(curvature(measured, lp.steerRatio, self.wheelbase))
+                    if valid and self.wheelbase
+                    else math.nan
+                ),
                 gear=str(cs.gearShifter),
                 brake_pressed=bool(cs.brakePressed),
                 gas_pressed=bool(cs.gasPressed),
@@ -128,11 +153,14 @@ class Bridge:
         panda_states,
         panda_states_valid,
         requested_torque,
+        requested_angle,
         limited_by_safety,
     ):
         """Retain one coherent control-cycle snapshot for the recorder."""
         actuators = car_output.actuatorsOutput
         self.evidence.update(
+            requested_angle_deg=finite(requested_angle),
+            applied_angle_deg=finite(actuators.steeringAngleDeg) if output_valid else None,
             requested_torque_normalized=finite(requested_torque),
             applied_torque_normalized=finite(actuators.torque) if output_valid else None,
             applied_torque_can=finite(actuators.torqueOutputCan) if output_valid else None,
@@ -190,15 +218,21 @@ class Bridge:
         # openpilot's curvature is right-positive; its wheel angle is left-positive.
         # angleOffset was removed from the measurement once above. Do not add it
         # here: LatControl's conversion back to physical angle already owns it.
-        target = -vm.calc_curvature(math.radians(self.selection.angle_deg), speed, roll)
+        chunk = self.selection.curvature_inv_m
+        if chunk is None:
+            requested = self.selection.angle_deg
+        else:  # a policy chunk's kinematic curvature; the same scale caps it below
+            requested = float(wheel_angle(chunk, vm.sR, vm.l))
+        target = -vm.calc_curvature(math.radians(requested), speed, roll)
         if not self.controller.sample.lateral_active:
-            self.controller.applied_angle(self.selection.angle_deg)
+            self.controller.applied_angle(requested)
             return target, False
         # Include the prior native demand so scale changes still respect jerk limits.
+        scale = self.controller.settings.max_steering_angle_deg
         bound = math.radians(
             max(
-                self.controller.settings.max_steering_angle_deg,
-                abs(self.selection.angle_deg),
+                scale,
+                abs(requested) if chunk is None else 0,
                 abs(math.degrees(vm.get_steer_from_curvature(-previous_curvature, speed, roll))),
             )
         )

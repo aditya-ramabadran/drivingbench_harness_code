@@ -3,18 +3,20 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>DrivingBench Sandbox Master UI</title>
+    <title>DrivingBench Harness</title>
     <link rel="stylesheet" href="/assets/style.css" />
     <script src="/assets/prompt.js" defer></script>
     <script src="/assets/app.js" defer></script>
+    <script src="/assets/workspace.js" defer></script>
     <script src="/assets/drive.js" defer></script>
+    <script src="/assets/runner.js" defer></script>
   </head>
   <body>
     <main>
       <header>
         <div>
-          <p class="eyebrow">DRIVINGBENCH SANDBOX</p>
-          <h1>DrivingBench Sandbox Master UI</h1>
+          <p class="eyebrow">DRIVINGBENCH HARNESS</p>
+          <h1>DrivingBench</h1>
           <p id="summary" class="lede">Connecting to the comma…</p>
         </div>
         <div class="header-actions">
@@ -25,22 +27,51 @@
       </header>
       <nav class="workspace-nav" role="tablist" aria-label="Workspace">
         <button id="setup-tab" type="button" role="tab" aria-controls="setup-panel" aria-selected="true">Setup</button>
-        <button id="drive-tab" type="button" role="tab" aria-controls="drive-panel" aria-selected="false" tabindex="-1">Drive</button>
+        <button id="drive-tab" type="button" role="tab" aria-controls="drive-panel" aria-selected="false" tabindex="-1">Drive via chat app</button>
+        <button id="runner-tab" type="button" role="tab" aria-controls="runner-panel" aria-selected="false" tabindex="-1">Drive via runner loop</button>
       </nav>
       <p id="notice" class="notice" role="status" aria-live="polite">Loading status…</p>
       <p id="operation-result" class="operation-result" role="status" aria-live="assertive" hidden></p>
 
-      <section class="card" aria-labelledby="control-title">
-        <h2 id="control-title">Connected control</h2>
-        <p>DrivingBench is always active · <span id="engagement">Unknown</span></p>
-        <p class="quiet">Any connected chat can send the next command. Commands replace globally; they do not queue. Stop cancels the command and brakes. A fresh command is required to resume.</p>
+      <section class="card" aria-labelledby="live-title">
+        <div class="section-heading"><h2 id="live-title">Vehicle</h2><span id="engagement" class="chip">Unknown</span></div>
+        <p id="drive-notice" class="quiet">Waiting for vehicle telemetry.</p>
+        <dl class="drive-measurements">
+          <div><dt>Speed</dt><dd id="drive-speed">Unknown</dd></div>
+          <div><dt>Steering (positive left)</dt><dd id="drive-steering">Unknown</dd></div>
+          <div><dt>Verified hold</dt><dd id="drive-hold">Unknown</dd></div>
+          <div><dt>Current command</dt><dd id="drive-command">Unknown</dd></div>
+        </dl>
+        <details id="live-cameras"><summary>Live cameras</summary>
+        <label class="live-toggle"><input id="cameras-live" type="checkbox" /> Update images for 20 s</label>
+        <div class="camera-grid">
+          <article><h3>Narrow camera</h3><p id="drive-narrow-status">Waiting for an image.</p><img id="drive-narrow-image" alt="Narrow camera" hidden /></article>
+          <article><h3>Wide camera</h3><p id="drive-wide-status">Waiting for an image.</p><img id="drive-wide-image" alt="Wide camera" hidden /></article>
+        </div>
+        </details>
       </section>
-
       <div id="setup-panel" role="tabpanel" aria-labelledby="setup-tab">
+        <section class="card">
+          <div class="section-heading"><h2>Evaluation labels</h2><span class="chip">Saved on this laptop</span></div>
+          <p class="quiet">Recorded with each new trial. Use a new course ID when the cone layout changes. This labels evidence; it does not change the model's objective.</p>
+          <div class="input-grid">
+            <label>Course ID<input id="evaluation-course" maxlength="120" placeholder="lot-a-layout-2" /></label>
+            <label>Operator<input id="evaluation-operator" maxlength="120" placeholder="name or initials" /></label>
+          </div>
+          <button id="evaluation-save" type="button">Save evaluation labels</button>
+          <p id="evaluation-result" class="quiet" role="status"></p>
+        </section>
+        <section class="card">
+          <div class="section-heading"><h2>Laptop setup</h2><button id="doctor-run" type="button">Check laptop setup</button></div>
+          <p class="quiet">Checks installed code, chat registrations, credential presence and transcript paths. For Hugging Face access use <code>uv run drivingbench doctor --network</code>; near the car add <code>--device</code>.</p>
+          <div id="doctor-results" role="status"></div>
+        </section>
         <section class="card" aria-labelledby="online-title">
           <h2 id="online-title">1. Bring the comma online</h2>
           <p class="quiet">Connect this laptop and the comma to the same network, then connect to the installed producer.</p>
           <button id="online" class="primary" type="button">Bring online</button>
+          <label class="vehicle-guide-select">Vehicle guide<select id="vehicle-guide"><option value="tesla" selected>Tesla Model 3 (default)</option><option value="toyota">Toyota</option></select></label>
+          <p id="setup-engagement-reminder" class="engagement-reminder"></p>
         </section>
         <section class="card" aria-labelledby="clients-title">
           <h2 id="clients-title">2. Check your chat app</h2>
@@ -68,6 +99,7 @@
             <label>Steering scale (steering-wheel degrees at 100%)<input id="max_steering_angle_deg" type="number" min="0.1" step="any" disabled /></label>
             <label>Speed ceiling (m/s, 0.5–3.5)<input id="speed_limit_mps" type="number" min="0.5" max="3.5" step="any" disabled /></label>
           </div>
+          <label>Objective<textarea id="objective" rows="3" disabled></textarea></label>
           <p class="quiet">Saved changes sync to every laptop. Image adjustments apply to the model and Drive cameras. Steering and speed changes apply to the next command; the car's native limits still apply.</p>
           <div class="action-row">
             <button id="save-settings" type="button" disabled>Save settings</button>
@@ -78,70 +110,145 @@
           <h2 id="readiness-title">4. Check vehicle readiness</h2>
           <ul id="readiness-checklist"><li>Waiting for vehicle telemetry.</li></ul>
           <p id="readiness-instruction">Waiting for vehicle telemetry.</p>
-          <p class="quiet">Press SET while holding the brake. Release the brake when ready, and press RES if the car asks when motion is sent.</p>
+
         </section>
-        <section class="card" aria-labelledby="session-title">
-          <h2 id="session-title">5. Labeled session (optional)</h2>
-          <p class="quiet">Unlabeled driving is recorded as segments anyway. Start a session to group the next segments under a model and harness for the benchmark; end it with an outcome. Starting another session ends the current one.</p>
-          <div id="session-form" class="input-grid">
-            <label>Model<input id="session-model" type="text" maxlength="80" placeholder="exact model name" /></label>
-            <label>Harness<select id="session-harness"><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="cursor">Cursor</option><option value="other">Other</option></select></label>
-            <label>Notes<input id="session-notes" type="text" maxlength="200" placeholder="lot A, left loop, try 3" /></label>
-          </div>
-          <div id="session-open" hidden>
-            <p id="session-current" class="session-current"></p>
-            <div class="input-grid">
-              <label>Outcome<select id="session-outcome"><option value="completed">Completed</option><option value="collision">Collision</option><option value="aborted">Aborted</option></select></label>
-              <label>Note<input id="session-note" type="text" maxlength="200" placeholder="optional" /></label>
-            </div>
-          </div>
-          <div class="action-row">
-            <button id="session-start" class="primary" type="button" disabled>Start session</button>
-            <button id="session-end" type="button" hidden>End session</button>
-          </div>
-        </section>
-        <section class="card" aria-labelledby="task-title">
-          <h2 id="task-title">6. Optional prompt builder</h2>
-          <p class="quiet">Any chat with the MCP tools can drive; no attach step is needed. The prompt is generated from the saved objective and car settings and does not bind a chat.</p>
-          <label>Objective<textarea id="objective" rows="3" disabled></textarea></label>
-          <div class="draft-options">
-            <button id="generate-prompt" type="button" disabled>Create prompt from saved settings</button>
-          </div>
-          <label>Prompt<textarea id="prompt" rows="12" disabled></textarea></label>
-          <div class="action-row">
-            <button id="save-task" type="button" disabled>Save task</button>
-            <button id="reset-task" type="button" disabled>Reset changes</button>
-            <button id="copy-prompt" type="button" disabled>Copy prompt</button>
-          </div>
-          <p class="quiet">Save shares your task with other laptops. Copy includes your unsaved prompt edits.</p>
-          <div class="input-grid canned">
-            <label>Reflection prompt<textarea id="reflection-prompt" rows="4" readonly>Your previous attempt has now ended (likely due to a mistake or collision with an object or the environment). Reflect on how you did in your previous attempt, why it might have ended, and what you can do better in a future attempt.</textarea><button id="copy-reflection" type="button">Copy</button></label>
-            <label>Continuation prompt<textarea id="continuation-prompt" rows="4" readonly>You now have been granted another attempt to complete the same objective as before. Begin now.</textarea><button id="copy-continuation" type="button">Copy</button></label>
-          </div>
+        <section class="card" aria-labelledby="prompt-title">
+          <h2 id="prompt-title">5. Prompt</h2>
+          <p class="quiet">Generated from the saved settings and objective; save step 3 to change it. Start trial on the Drive tab copies it.</p>
+          <textarea id="prompt" rows="12" readonly></textarea>
+          <details>
+            <summary>Reflection and continuation prompts</summary>
+            <p id="reflection-text"></p>
+            <p id="continuation-text"></p>
+          </details>
         </section>
       </div>
 
       <div id="drive-panel" role="tabpanel" aria-labelledby="drive-tab" hidden>
-        <section class="card" aria-labelledby="live-title">
-          <h2 id="live-title">Live operator view</h2>
-          <p id="drive-notice" class="quiet">Waiting for vehicle telemetry.</p>
-          <p class="quiet">Both cameras use the saved image adjustments. The model camera selection only controls which cameras observe returns.</p>
-          <div class="camera-grid">
-            <article><h3>Narrow camera</h3><p id="drive-narrow-status">Waiting for an image.</p><img id="drive-narrow-image" alt="Narrow camera" hidden /></article>
-            <article><h3>Wide camera</h3><p id="drive-wide-status">Waiting for an image.</p><img id="drive-wide-image" alt="Wide camera" hidden /></article>
+        <section class="card" aria-labelledby="drive-online-title">
+          <div class="section-heading"><h2 id="drive-online-title">Connect the comma</h2><button id="drive-online" class="primary" type="button">Bring online</button></div>
+          <p class="quiet">Connect this laptop and the comma to the same Wi-Fi, then bring the installed producer online.</p>
+          <p id="drive-engagement-reminder" class="engagement-reminder"></p>
+        </section>
+        <section class="card" aria-labelledby="trial-title">
+          <h2 id="trial-title">Trial</h2>
+          <div id="session-form">
+            <p class="quiet">One trial is one fresh chat and one labeled session; its attempts stay in that chat.</p>
+            <div class="input-grid">
+              <label>Model<select id="session-model"><optgroup label="Chat app: copy the prompt into Codex, Claude Code or Cursor"><option>GPT-6 Astra</option><option>GPT-6.1 Sol</option><option>Claude Fable 5.1</option><option>Claude Opus 5.5</option><option>Grok 4.7</option><option>Gemini 4 Argon</option><option>Claude Sonnet 5.5</option><option value="other">Other…</option></optgroup><optgroup label="Demonstration"><option>Human demonstration</option></optgroup></select></label>
+              <label id="session-model-other-label" hidden>Model name<input id="session-model-other" type="text" maxlength="80" placeholder="exact model name" /></label>
+              <label id="session-tier-label">Inference tier<select id="session-tier"><option value="normal">Normal</option><option value="fast">Fast</option><option value="ultrafast">Ultrafast</option></select></label>
+              <label id="session-harness-label">Harness<select id="session-harness"><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="cursor">Cursor</option><option value="other">Other</option></select></label>
+              <label id="session-notes-label">Notes<input id="session-notes" type="text" maxlength="200" placeholder="lot A, trial 1/3" /></label>
+            </div>
+            <div id="demo-fields" class="input-grid" hidden>
+              <label>Lot<input id="demo-lot" type="text" maxlength="40" placeholder="B" /></label>
+              <label>Layout<input id="demo-layout" type="text" maxlength="40" placeholder="2" /></label>
+              <label>Direction<input id="demo-direction" type="text" maxlength="40" placeholder="north, or clockwise" /></label>
+              <label>Split<select id="demo-split"><option value="train">train</option><option value="val">val (whole layouts only)</option></select></label>
+            </div>
+            <p id="demo-next" class="quiet" hidden></p>
+            <button id="session-start" class="primary" type="button" disabled>Start trial and copy prompt</button>
           </div>
-          <dl class="drive-measurements">
-            <div><dt>Speed</dt><dd id="drive-speed">Unknown</dd></div>
-            <div><dt>Steering (positive left)</dt><dd id="drive-steering">Unknown</dd></div>
-            <div><dt>Verified hold</dt><dd id="drive-hold">Unknown</dd></div>
-            <div><dt>Current command</dt><dd id="drive-command">Unknown</dd></div>
-          </dl>
+          <div id="session-open" hidden>
+            <p id="session-current" class="session-current"></p>
+            <div class="input-grid">
+              <label>Attempt result<select id="attempt-outcome"><option value="unknown">Unknown / not graded</option><option value="completed">Finished course</option><option value="intervention">Operator intervention</option><option value="collision">Collision</option><option value="aborted">Aborted</option></select></label>
+              <label>Attempt note<input id="attempt-note" maxlength="500" placeholder="Why it ended, or finish confirmation" /></label>
+            </div>
+            <p id="attempt-marker-status" class="quiet" role="status">Attempt boundaries are recorded when you use the buttons below.</p>
+            <div id="session-copy-row" class="action-row">
+              <button id="copy-prompt" type="button">Copy prompt</button>
+              <button id="copy-reflection" type="button">End attempt &amp; copy reflection</button>
+              <button id="copy-continuation" type="button">Next attempt &amp; copy continuation</button>
+            </div>
+            <div class="input-grid">
+              <label id="session-attempts-label">Attempts (F or S each)<input id="session-attempts" type="text" maxlength="10" placeholder="FFS" /></label>
+              <label>Outcome<select id="session-outcome"><option value="completed">Completed</option><option value="collision">Collision</option><option value="aborted">Aborted</option></select></label>
+              <label>Note<input id="session-note" type="text" maxlength="200" placeholder="optional" /></label>
+            </div>
+            <button id="session-end" type="button">End trial</button>
+          </div>
+          <div id="demo-guide" class="demo-guide" hidden>
+            <p class="demo-speed"><span id="demo-speed" data-level="unknown">— mph</span> <span id="demo-elapsed" class="demo-elapsed"></span></p>
+            <p id="demo-tally" class="demo-tally"></p>
+            <ul class="demo-checklist">
+              <li>Training layouts only, never the benchmark layout; name the lot and layout in the notes.</li>
+              <li>Mostly 1–4.5 mph: amber above 5 mph, red above 7 mph (the commands' 3.5 m/s ceiling).</li>
+              <li>Include a recovery: start off-centre or turn in late, then correct.</li>
+              <li>End inside the finish area and hold the stop for a few seconds before ending.</li>
+            </ul>
+          </div>
         </section>
         <section class="card" aria-labelledby="history-title">
-          <h2 id="history-title">Tool-call history</h2>
-          <p id="history-notice" class="quiet">Shared calls from all connected chats. Images in recorded calls are past observations.</p>
+          <div class="section-heading"><h2 id="history-title">Tool-call history</h2><label class="live-toggle"><input id="history-live" type="checkbox" /> Update for 20 s</label></div>
+          <p id="history-notice" class="quiet">Switch on updates to load shared calls from all connected chats. Images in recorded calls are past observations.</p>
           <div id="history-calls"></div>
         </section>
+      </div>
+      <div id="runner-panel" role="tabpanel" aria-labelledby="runner-tab" hidden>
+        <p class="mode-description">Drive from this laptop with an API chat model, a decision model, a trained policy, or a chat model supervising either. Chat models keep their context across attempts; each attempt restarts the driver.</p>
+      <section class="card">
+        <div class="section-heading"><h2>Runner setup</h2><span id="runner-key" class="quiet"></span></div>
+        <div class="button-row">
+          <button id="runner-online" class="primary" type="button" disabled>Bring online</button>
+          <span class="quiet">Connect this laptop and the comma to the same network, then connect to the installed producer.</span>
+        </div>
+        <p id="runner-engagement-reminder" class="engagement-reminder"></p>
+        <p class="quiet">Start attempt brings the comma online if needed and checks a trained driver's endpoint once before the session opens.</p>
+        <p id="runner-online-result" class="operation-result" role="status" aria-live="assertive" hidden></p>
+        <div class="input-grid">
+          <label>Driver<select id="runner-driver"></select></label>
+          <p id="runner-mode" class="quiet"></p>
+          <label id="runner-supervisor-label">Chat model<select id="runner-supervisor"></select></label>
+          <label id="runner-google-model-label" hidden>Exact Google model ID<input id="runner-google-model" placeholder="e.g. gemini-3.8-flash" autocomplete="off"></label>
+          <label id="runner-tier-label">Inference tier<select id="runner-tier"></select></label>
+          <div id="runner-google-tools" class="runner-google-tools" hidden>
+            <div class="button-row"><button id="runner-google-models" type="button">Refresh Google models</button><button id="runner-google-probe" type="button">Test Gemini connection</button></div>
+            <p class="quiet">Direct to Google's Gemini API with your own key. The test makes two small requests with a synthetic image; free quota or paid rates apply for the account and model. It never connects to the car. A catalog listing alone does not establish model access. Fast requests Priority; the served tier is recorded when Google reports it.</p>
+            <p id="runner-google-result" class="operation-result" role="status" hidden></p>
+          </div>
+          <label id="runner-objective-label">Objective<textarea id="runner-objective" rows="3"></textarea></label>
+          <label id="runner-brief-label">Starting brief (optional; built from the objective otherwise)<textarea id="runner-brief" rows="3"></textarea></label>
+          <label id="runner-prompt-label">Model prompt<textarea id="runner-prompt" rows="6" readonly></textarea></label>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-heading"><h2>Run</h2><span id="runner-state" class="quiet">stopped</span></div>
+        <div class="button-row">
+          <label>Attempt result<select id="runner-attempt-outcome"><option value="unknown">Unknown / not graded</option><option value="completed">Finished course</option><option value="intervention">Operator intervention</option><option value="collision">Collision</option><option value="aborted">Aborted</option></select></label>
+          <label>Attempt note<input id="runner-attempt-note" maxlength="500" placeholder="Why it ended" /></label>
+          <button id="runner-start" class="primary" type="button">Start attempt 1</button>
+          <button id="runner-end-attempt" type="button" disabled>End attempt (send reflection)</button>
+          <button id="runner-next-attempt" type="button" disabled>Next attempt (send continuation)</button>
+          <button id="runner-resume" type="button" disabled>Resume driver</button>
+        </div>
+        <div class="button-row">
+          <input id="runner-message" type="text" maxlength="500" placeholder="Message to the supervisor, e.g. Continue" disabled />
+          <button id="runner-send" type="button" disabled>Send</button>
+        </div>
+        <div class="button-row">
+          <select id="runner-outcome" aria-label="Outcome"></select>
+          <input id="runner-note" type="text" maxlength="200" placeholder="Note for the session (optional)" disabled />
+          <button id="runner-stop" class="danger" type="button" disabled>Stop run</button>
+        </div>
+        <p id="runner-result" class="operation-result" role="status" aria-live="assertive" hidden></p>
+      </section>
+
+      <section class="card runner-live">
+        <aside>
+          <h3>Driver brief <span id="runner-revision" class="quiet"></span></h3>
+          <pre id="runner-current-brief" class="brief">—</pre>
+          <h3>Driver decisions</h3>
+          <ol id="runner-decisions" class="calls"></ol>
+        </aside>
+      </section>
+
+      <section class="card">
+        <div class="section-heading"><h2>Supervisor</h2><span id="runner-cost" class="quiet"></span></div>
+        <ol id="runner-transcript" class="calls"></ol>
+      </section>
       </div>
     </main>
   </body>

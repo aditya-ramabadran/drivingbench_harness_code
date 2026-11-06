@@ -1,13 +1,12 @@
-"""Regressions replayed from real Toyota Corolla telemetry.
+"""Regressions replayed from real Corolla telemetry.
 
 tests/fixtures/corolla-20260913.jsonl holds carState, carControl and controlsState
-samples recorded on a comma during early identification drives in a parking lot.
-The measurements drive the controller through the same launch, roll, turn and
-stop sequences the car actually produced; nothing here claims physical smoothness.
+samples recorded on the comma during system-identification runs. The measurements
+drive the controller through the same launch, roll, turn and stop sequences the car
+actually produced; nothing here claims physical smoothness.
 """
 
 import json
-import math
 from pathlib import Path
 
 import pytest
@@ -122,7 +121,8 @@ def test_launch_wait_roll_and_overshoot_without_windup():
     assert all(x[2].angle_deg == x[1]["steeringAngleDeg"] for x in waiting)
     # No integrator wound up while waiting: the roll starts from the bounded proportional term.
     rolling = next(x for x in trace if x[1]["vEgo"] > 0.5)
-    assert rolling[2].acceleration_mps2 == pytest.approx(0.5 * 1.6, abs=0.02)
+    gain, cap = SETTINGS.speed_control.gain, SETTINGS.speed_control.max_accel_mps2
+    assert rolling[2].acceleration_mps2 == pytest.approx(min(gain * 1.6, cap), abs=0.02)
     peak = max(trace, key=lambda x: x[1]["vEgo"])
     assert 2.2 < peak[1]["vEgo"] < SETTINGS.speed_limit_mps and c.reason is None
     assert peak[2].acceleration_mps2 < 0  # still brakes above target without the reserve
@@ -183,6 +183,6 @@ def test_speed_feedback_removes_reserve_from_recorded_launch():
     requested = None
     for row in rows:
         for _ in range(50):
-            requested = speed.step(0.65, row["vEgo"], 0.01, 813.0)
-    assert requested == pytest.approx(0.325, abs=1e-4)
-    assert math.isclose(0.325, SETTINGS.speed_control.gain * 0.65)
+            requested = speed.step(0.65, row["vEgo"], 0.01)
+    assert requested == pytest.approx(SETTINGS.speed_control.gain * 0.65, abs=1e-4)
+    assert requested > 0.2925  # no reserve held back

@@ -98,7 +98,10 @@ class NativeClient:
                     value["received_at"] = time.monotonic()
                     self._snapshot = value
                     if self.on_status:
-                        self.on_status(value)
+                        try:
+                            self.on_status(value)
+                        except Exception as error:  # evidence never stops the heartbeat
+                            value["status_error"] = f"{type(error).__name__}: {error}"[:200]
                 except (OSError, ValueError):
                     if time.monotonic() - self._snapshot.get("received_at", 0) > NATIVE_WATCHDOG_S:
                         self._snapshot = {

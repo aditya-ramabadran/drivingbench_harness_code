@@ -12,8 +12,10 @@ window.DrivingBenchTraces = (() => {
     const frames = [];
     const calls = [];
     const telemetry = [];
+    let plans = 0; // a trained policy's chunks, a few a second: counted, not listed as calls
     for (const event of events) {
-      if (event.kind === "tool") {
+      if (event.kind === "tool" && event.tool === "chunk") plans += 1;
+      else if (event.kind === "tool") {
         calls.push({ t: at(event), ...event });
         for (const image of event.images || []) {
           const name = String(image.url || "").split("/").pop();
@@ -24,7 +26,7 @@ window.DrivingBenchTraces = (() => {
       }
     }
     const last = events[events.length - 1];
-    return { t0, duration: Math.max(at(last), 0.001), frames, calls, telemetry };
+    return { t0, duration: Math.max(at(last), 0.001), frames, calls, plans, telemetry };
   }
   // The latest item whose time is at or before t (frames persist until replaced).
   const latest = (items, t) => { let found = null; for (const item of items) { if (item.t <= t) found = item; else break; } return found; };
@@ -60,7 +62,7 @@ window.DrivingBenchTraces = (() => {
         segment.id,
         segment.session || "—",
         session ? `${session.model} · ${session.harness}${session.outcome ? ` · ${session.outcome}` : ""}` : "unlabeled",
-        String(segment.tool_calls),
+        segment.plans ? `${segment.tool_calls} + ${segment.plans} plans` : String(segment.tool_calls),
         segment.chat ? "yes" : "—",
       ];
       cells.forEach((text, i) => {
@@ -83,7 +85,7 @@ window.DrivingBenchTraces = (() => {
     node("player").hidden = false;
     node("player-title").textContent = id;
     const session = index.sessions.find((s) => (s.segments || []).includes(id));
-    node("player-meta").textContent = `${events[0].timestamp.slice(0, 19).replace("T", " ")} UTC · ${fmt(line.duration, 1)} s · ${line.calls.length} tool calls · ${line.frames.length} frames · ${line.telemetry.length} telemetry samples`
+    node("player-meta").textContent = `${events[0].timestamp.slice(0, 19).replace("T", " ")} UTC · ${fmt(line.duration, 1)} s · ${line.calls.length} tool calls · ${line.plans} policy plans · ${line.frames.length} frames · ${line.telemetry.length} telemetry samples`
       + (session ? ` · session ${session.id}: ${session.model} on ${session.harness}${session.outcome ? `, ${session.outcome}` : ""}` : " · unlabeled");
     node("duration").textContent = `${fmt(line.duration, 1)} s`;
     node("markers").replaceChildren();

@@ -4,6 +4,7 @@ import io
 import json
 import queue
 import socket
+import sys
 import threading
 import time
 from pathlib import Path
@@ -13,9 +14,10 @@ import pytest
 from drivingbench.controller.core import Controller, Sample
 from drivingbench.device.cameras import Cameras, Frame, camera_clock, encode_nv12
 from drivingbench.device.ipc import NativeClient, NativeServer
+from drivingbench.device.recording import Recorder
 from drivingbench.device.service import create_app
 from drivingbench.device.settings import SettingsStore
-from drivingbench.shared.contracts import Settings
+from drivingbench.shared.contracts import STEERING_SCALE_DEG, Settings
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -77,7 +79,7 @@ def test_motion_stop_and_next_command_without_camera(producer):
     client, _, native, _ = producer
     motion = dict(direction="left", steering_percent=50, speed_mps=0.6, duration_s=5)
     assert client.post("/motion", json=motion).json() == {"status": "accepted"}
-    assert native.controller.command["target_angle_deg"] == 90
+    assert native.controller.command["target_angle_deg"] == STEERING_SCALE_DEG / 2
     assert client.post("/stop", json={}).json() == {"status": "stopping"}
     assert client.post("/motion", json=motion).json() == {"status": "accepted"}
     assert client.post("/arm", json={}).status_code == 404
@@ -116,7 +118,7 @@ def test_hot_setting_snapshots_and_duplicate_no_new_deadline(producer):
     client.post("/motion", json=command)
     assert native.controller.command["expires_at_s"] == deadline
     client.patch("/settings", json={"max_steering_angle_deg": 360})
-    assert native.controller.command["target_angle_deg"] == -180
+    assert native.controller.command["target_angle_deg"] == -STEERING_SCALE_DEG
     command["request_id"] = uuid4().hex
     client.post("/motion", json=command)
     assert native.controller.command["target_angle_deg"] == -360
@@ -195,10 +197,10 @@ def test_recording_failure_leaves_motion_and_history_usable(producer):
 
 def test_observe_reports_steering_in_the_commanded_scale(producer):
     client, _, native, _ = producer
-    native.controller.sample.steering_deg = -180.0
+    native.controller.sample.steering_deg = -STEERING_SCALE_DEG
     assert client.get("/observe").json()["steering_percent"] == -100.0
-    client.patch("/settings", json={"max_steering_angle_deg": 480})
-    assert client.get("/observe").json()["steering_percent"] == -37.5
+    client.patch("/settings", json={"max_steering_angle_deg": 2 * STEERING_SCALE_DEG})
+    assert client.get("/observe").json()["steering_percent"] == -50.0
     native.controller.sample.steering_deg = float("nan")
     packet = client.get("/observe").json()
     assert packet["steering_percent"] is None and "steering_deg" not in packet  # one unit
@@ -212,7 +214,7 @@ def test_reason_is_recorded_evidence_only(producer):
     assert "reason" not in native.controller.command
     assert client.post("/stop", json={"reason": "Operator waved."}).json() == {"status": "stopping"}
     assert client.post("/stop", json={}).json() == {"status": "stopping"}
-    assert client.post("/stop", json={"reason": "x" * 201}).status_code == 422
+    assert client.post("/stop", json={"reason": "x" * 601}).status_code == 422
     assert client.post("/stop", json={"why": "nope"}).status_code == 422
     calls = client.get("/history").json()["calls"]  # rejected requests are not recorded
     assert [call["tool"] for call in calls] == ["set_motion", "stop_now", "stop_now"]
@@ -225,7 +227,8 @@ def test_reason_is_recorded_evidence_only(producer):
 
 
 def test_recorder_splits_segments_thumbnails_images_and_closes_after_restart(tmp_path):
-    from drivingbench.device.recording import SEGMENT_PATTERN, Recorder
+    from drivingbench.device.recording import Recorder
+    from drivingbench.gateway.traces import SEGMENT_ID
 
     def events(folder):
         return [json.loads(line) for line in (folder / "events.jsonl").read_text().splitlines()]
@@ -240,7 +243,7 @@ def test_recorder_splits_segments_thumbnails_images_and_closes_after_restart(tmp
         images=[{"url": "/api/recordings/" + recorder.image(big.getvalue())}],
     )
     segment = recorder.begin_segment(source="native_engaged")
-    assert SEGMENT_PATTERN.match(segment)
+    assert SEGMENT_ID.fullmatch(segment)  # the id the laptop publishes and serves
     assert recorder.begin_segment() == segment  # beginning twice never forks a segment
     name = recorder.image(big.getvalue())
     recorder.record("tool", tool="set_motion", arguments={"reason": "left gap"})
@@ -334,8 +337,13 @@ def test_producer_session_endpoints_validate_and_label(producer):
     native.on_status(native.status())  # segment opens inside the session
     segment = client.get("/status").json()["segment"]
     assert client.post("/stop", json={}).json() == {"status": "stopping"}
-    ended = client.post("/session/end", json={"outcome": "completed", "note": "clean"}).json()
+    for attempts in ("FX", "ffs", "F" * 11):
+        bad = {"outcome": "completed", "attempts": attempts}
+        assert client.post("/session/end", json=bad).status_code == 422
+    end = {"outcome": "completed", "note": "clean", "attempts": "FFS"}
+    ended = client.post("/session/end", json=end).json()
     assert ended["segments"] == [segment] and ended["outcome"] == "completed"
+    assert ended["attempts"] == "FFS"
     assert client.get("/status").json()["session"] is None
     calls = client.get("/history").json()["calls"]
     assert calls[-1]["session"] == started["id"] and calls[-1]["segment"] == segment
@@ -437,14 +445,48 @@ def test_native_offline_keeps_observe_and_settings_but_refuses_motion(tmp_path):
         assert client.get("/status").json()["settings"]["speed_limit_mps"] == 2
 
 
+def test_chunks_reach_native_and_are_recorded_like_any_command(producer):
+    client, _, native, _ = producer
+    native.on_status(native.status())
+    body = {"curvature_inv_m": [0.02, 0.04], "speed_mps": [1.0, 1.2], "reason": "policy step 3"}
+    accepted = client.post("/chunk", json=body, headers={"X-Client": "driver"}).json()
+    assert accepted == {"status": "accepted"}
+    assert native.controller.command["setpoints"] == [(0.02, 1.0), (0.04, 1.2)]
+    for bad in (
+        {"curvature_inv_m": [0], "speed_mps": [0.2]},
+        {"speed_mps": [1]},
+        {**body, "x": 1},
+    ):
+        assert client.post("/chunk", json=bad).status_code == 422
+    call = client.get("/history").json()["calls"][-1]
+    assert (call["tool"], call["client"], call["arguments"]) == ("chunk", "driver", body)
+    # A policy's plan is anchored on the camera clock its frame carries; the producer converts
+    # it to native monotonic time once, and records what the client sent.
+    captured = camera_clock() - 0.6
+    anchored = {**body, "anchor_s": captured - 0.2}
+    sent = time.monotonic()
+    assert client.post("/chunk", json=anchored).json() == {"status": "accepted"}
+    assert native.controller.command["anchor_s"] == pytest.approx(sent - 0.8, abs=0.05)
+    assert client.get("/history").json()["calls"][-1]["arguments"] == anchored
+
+
 def test_settings_survive_reopen_and_partial_patches(tmp_path):
     store = SettingsStore(tmp_path / "settings.json")
     store.patch({"max_steering_angle_deg": 400})
-    store.patch({"prompt": "go"})
+    store.patch({"objective": "go"})
     reopened = SettingsStore(store.path)
     value, revision = reopened.snapshot()
     assert value.max_steering_angle_deg == 400
-    assert value.prompt == "go" and revision == 2
+    assert value.objective == "go" and revision == 2
+
+
+def test_saved_settings_with_unknown_fields_are_refused_and_left_untouched(tmp_path):
+    path = tmp_path / "settings.json"
+    saved = json.dumps({"settings": {"objective": "loop", "prompt": "old"}, "revision": 4})
+    path.write_text(saved)
+    with pytest.raises(ValueError, match="prompt"):
+        SettingsStore(path)
+    assert path.read_text() == saved
 
 
 def test_stop_does_not_wait_for_settings_disk_write_or_camera_encoding(producer, monkeypatch):
@@ -484,11 +526,11 @@ def test_producer_restart_does_not_reseed_saved_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(service.uvicorn, "run", lambda *args, **kwargs: None)
     service.main()
     store = SettingsStore(state / "settings.json")
-    store.patch({"max_steering_angle_deg": 380, "prompt": "keep me"})
+    store.patch({"max_steering_angle_deg": 380, "objective": "keep me"})
     service.main()
     saved, revision = SettingsStore(store.path).snapshot()
     assert saved.max_steering_angle_deg == 380
-    assert saved.prompt == "keep me" and revision == 1
+    assert saved.objective == "keep me" and revision == 1
 
 
 def test_lost_heartbeat_reply_does_not_wait_user_rpc_timeout(tmp_path):
@@ -511,7 +553,52 @@ def test_lost_heartbeat_reply_does_not_wait_user_rpc_timeout(tmp_path):
     assert client.times[1] - client.times[0] < 0.5
 
 
-def test_native_socket_roundtrip_duplicate_owner_and_recovery(tmp_path):
+def test_the_heartbeat_survives_an_evidence_error(tmp_path):
+    class Client(NativeClient):
+        def call(self, body, *, timeout=None):
+            self.beats += 1
+            return {"protocol": 2, "state": "held"}
+
+    def broken(snapshot):
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    client = Client(tmp_path / "absent")
+    client.beats, client.on_status = 0, broken
+    client.start()
+    deadline = time.monotonic() + 1
+    while client.beats < 5 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    client.close()
+    assert client.beats >= 5 and client._thread.is_alive() is False
+    assert client.status()["status_error"].startswith("TypeError")
+
+
+def test_sessions_end_safely_while_telemetry_records_from_another_thread(tmp_path):
+    recorder = Recorder(tmp_path)
+    stop, errors = threading.Event(), []
+
+    def heartbeat():
+        while not stop.is_set():
+            try:
+                recorder.begin_segment(source="native_engaged")
+                recorder.record("telemetry", speed_mps=1)
+                recorder.end_segment("native_disengaged")
+            except Exception as error:
+                errors.append(error)
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # switch threads between nearly every bytecode
+    try:
+        beating = threading.Thread(target=heartbeat)
+        beating.start()
+        for _ in range(2000):
+            recorder.begin_session("model", "harness")
+            recorder.end_session("unknown")
+        stop.set()
+        beating.join()
+    finally:
+        sys.setswitchinterval(interval)
+    assert errors == []
     # Unix paths must be shorter than macOS's 104-byte limit.
     import tempfile
 
@@ -557,20 +644,6 @@ def test_nv12_padding_conversion_and_bad_layout():
     buffer.data = b"bad"
     with pytest.raises(ValueError, match="truncated"):
         encode_nv12(buffer)
-
-
-def test_saved_settings_reload_with_their_revision_and_reject_unknown_fields(tmp_path):
-    from drivingbench.shared.contracts import Settings
-
-    path = tmp_path / "settings.json"
-    settings = Settings().model_dump()
-    settings["speed_control"]["max_accel_mps2"] = 0.7
-    path.write_text(json.dumps({"settings": settings, "revision": 4}))
-    store = SettingsStore(path)
-    value, revision = store.snapshot()
-    assert revision == 4 and value.speed_control.max_accel_mps2 == 0.7
-    with pytest.raises(ValueError):
-        store.patch({"speed_control": {"speed_reserve_fraction": 0.1}})
 
 
 def test_camera_health_is_visible_alongside_native_reason(producer):

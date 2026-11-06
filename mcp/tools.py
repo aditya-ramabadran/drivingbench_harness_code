@@ -29,6 +29,17 @@ Duration = Annotated[
     float, Field(ge=DURATION_RANGE_S[0], le=DURATION_RANGE_S[1], allow_inf_nan=False)
 ]
 Reason = Annotated[str, Field(max_length=REASON_MAX_CHARS)]
+OBSERVE_KEYS = (
+    "timestamp",
+    "state",
+    "speed_mps",
+    "steering_percent",
+    "remaining_s",
+    "image_age_s",
+    "camera_reason",
+    "reason",
+    "error",
+)
 
 
 def text(value):
@@ -62,21 +73,7 @@ def make_server(client: httpx.AsyncClient, label="MCP"):
     async def observe() -> list:
         """See road images, actual speed/steering, and command state. Motion continues as you think."""
         packet = await request("GET", "/api/observe")
-        summary = {
-            key: packet[key]
-            for key in (
-                "timestamp",
-                "state",
-                "speed_mps",
-                "steering_percent",
-                "remaining_s",
-                "image_age_s",
-                "camera_reason",
-                "reason",
-                "error",
-            )
-            if key in packet
-        }
+        summary = {key: packet[key] for key in OBSERVE_KEYS if key in packet}
         images = packet.get("images", [])
         if images:
             summary["cameras"] = [image["camera"] for image in images]

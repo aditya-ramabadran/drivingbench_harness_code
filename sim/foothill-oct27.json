@@ -1,0 +1,21 @@
+{
+ "name": "Foothill College northern lot, 27 October 2026: the v1.1 course",
+ "timezone": "America/Los_Angeles",
+ "course": "sim/foothill-oct27-course.json",
+ "ground": "sim/foothill-oct27-ground.json",
+ "cones": "sim/foothill-oct27-cones.json",
+ "bounds": "sim/foothill-oct27-bounds.json",
+ "splats": {
+  "raw": "runs/sim/explorer/oct27.splat",
+  "clean": "runs/sim/explorer/oct27-nocones.splat",
+  "full": "runs/sim/explorer/oct27-nocones-full.splat"
+ },
+ "routes": "runs/sim/routes",
+ "fit_day": "2026-10-26",
+ "day": "2026-10-27",
+ "daylight": ["13:30", "17:41"],
+ "splat_window": ["15:30", "17:00"],
+ "reference_run": ["15:43:27", "15:45:02"],
+ "cone_windows": [["15:30", "16:00"], ["15:35", "15:52"], ["15:43", "15:46"]],
+ "work": "runs/sim/build/foothill-oct27"
+}

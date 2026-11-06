@@ -1,0 +1,12 @@
+{
+  "accel_delay_s": 0.1,
+  "accel_tau_s": 0.1,
+  "accel_gain": 1.0,
+  "accel_bias_mps2": 0.0,
+  "launch_s": 0.1902,
+  "launch_accel_mps2": 0.151,
+  "steer_delay_s": 0.04,
+  "steer_tau_s": 0.1,
+  "steer_rate_dps": 400,
+  "yaw_scale": 1.0228
+}

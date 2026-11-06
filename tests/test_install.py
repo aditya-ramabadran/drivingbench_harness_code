@@ -122,9 +122,7 @@ def test_custom_client_path_persists_and_is_used_by_status(monkeypatch, tmp_path
         ]
     )
     assert Config.load(config).client_configs == {"codex": str(custom)}
-    assert (
-        runtime[0].name == "drivingbench_harness_v0.1" or (runtime[0] / "pyproject.toml").is_file()
-    )
+    assert (runtime[0] / "pyproject.toml").is_file()
     assert (
         installed[0][0] == tmp_path / "bin/drivingbench-sandbox"
     )  # runtime venv, not the checkout
@@ -132,44 +130,6 @@ def test_custom_client_path_persists_and_is_used_by_status(monkeypatch, tmp_path
     assert installed[0][1]["codex"] == inspected[0]["codex"] == custom
     assert {"claude", "cursor"} <= inspected[0].keys()
     capsys.readouterr()
-
-
-def test_bundle_ships_the_native_files_with_upstream_and_installed_digests(tmp_path, monkeypatch):
-    """The manifest's digests come from native/upstream and native/drivingbench of this checkout."""
-    import tarfile
-
-    from drivingbench.device import deploy
-
-    repo = Path(__file__).resolve().parents[1]
-    upstream = json.loads((repo / "native/upstream.json").read_text())
-    assert all(
-        (repo / "native/upstream" / f).is_file() and (repo / "native/drivingbench" / f).is_file()
-        for f in upstream["files"]
-    )
-
-    def run(command, **kw):
-        if command[:2] == ["uv", "build"]:
-            Path(command[command.index("--out-dir") + 1]).mkdir(parents=True, exist_ok=True)
-            (Path(command[command.index("--out-dir") + 1]) / "x.whl").write_bytes(b"")
-        if command[:3] == ["uv", "pip", "install"]:
-            Path(command[command.index("--target") + 1]).mkdir(parents=True, exist_ok=True)
-
-    monkeypatch.setattr(deploy.subprocess, "run", run)
-    monkeypatch.setattr(
-        deploy.subprocess, "check_output", lambda command, **kw: "" if "status" in command else "abc123\n"
-    )
-    output = deploy.build_bundle(repo, tmp_path / "release.tgz", repo / "device/initial-settings.json")
-    with tarfile.open(output) as archive:
-        names = archive.getnames()
-        manifest = json.loads(archive.extractfile("manifest.json").read())
-    assert manifest["release"] == "abc123" and manifest["upstream"] == upstream["commit"]
-    for name in upstream["files"]:
-        assert f"native/{name}" in names
-        entry = manifest["native"][name]
-        assert entry["baseline"] == deploy.digest((repo / "native/upstream" / name).read_bytes())
-        assert entry["installed"] == deploy.digest((repo / "native/drivingbench" / name).read_bytes())
-        assert entry["baseline"] != entry["installed"]
-    assert {"activate.py", "initial-settings.json", "requirements.txt"} <= set(names)
 
 
 def test_native_deploy_refuses_unknown_files_before_changes(tmp_path):
@@ -248,6 +208,7 @@ def deployment(tmp_path, monkeypatch):
     checks, smoked = [], []
     monkeypatch.setattr(deploy, "require_park", lambda path: checks.append(path))
     monkeypatch.setattr(deploy, "smoke_imports", lambda *args: smoked.append(args))
+    monkeypatch.setattr(deploy, "disable_updates", lambda path: checks.append(("updates", path)))
     monkeypatch.setattr(deploy.subprocess, "run", lambda *a, **kw: pytest.fail("no subprocess"))
     return deploy, bundle, native, root, checks, smoked
 
@@ -256,7 +217,8 @@ def test_activation_preserves_native_backup_and_needs_no_network(deployment):
     deploy, bundle, native, root, checks, smoked = deployment
     result = deploy.activate(bundle, root, native, Path("/usr/bin/python3"))
     assert result["restart_required"]
-    assert len(checks) == 2  # before staging and again right before the rename
+    # Park before staging and again right before the rename; updates off before native edits.
+    assert checks == [native, native, ("updates", native)]
     release = (root / "current").resolve()
     assert smoked == [(Path("/usr/bin/python3"), release, native)]
     assert (release / "python/drivingbench/device/service.py").is_file()
@@ -273,23 +235,105 @@ def test_activation_preserves_native_backup_and_needs_no_network(deployment):
     assert subprocess.check_call(["sh", "-n", str(release / "start-producer")]) == 0
 
 
-def test_activation_replaces_the_previous_release_exports(deployment):
+def test_activation_replaces_every_earlier_drivingbench_export(deployment):
     deploy, bundle, native, root, _, _ = deployment
     (native / "launch_env.sh").write_bytes(
         b"#!/usr/bin/bash\nexport UNRELATED=keep\n"
-        b"# DrivingBench v0.1 release old\n"
+        b"# DrivingBench release old\n"
         b"export DRIVINGBENCH_MODE=experimental\n"
         b"export DRIVINGBENCH_PYTHON_ROOT=/data/drivingbench-v01/releases/old/python\n"
-        b"export DRIVINGBENCH_NATIVE_SOCKET=/data/drivingbench-v01/native.sock\n"
+        b"export DRIVINGBENCH_UNKNOWN_OPTION=1\n"
     )
     deploy.activate(bundle, root, native, Path("/usr/bin/python3"))
     lines = (native / "launch_env.sh").read_text().splitlines()
     assert lines[:2] == ["#!/usr/bin/bash", "export UNRELATED=keep"]
     exports = [line for line in lines if line.startswith("export DRIVINGBENCH_")]
     assert exports.count("export DRIVINGBENCH_MODE=experimental") == 1
-    assert not any("releases/old" in line for line in lines)
+    assert not any("UNKNOWN_OPTION" in line or "releases/old" in line for line in lines)
     python_root = (root / "current").resolve() / "python"
     assert f"export DRIVINGBENCH_PYTHON_ROOT={python_root}" in exports
+
+
+def test_fingerprint_pin_is_written_replaced_and_removed_with_the_release(deployment):
+    deploy, bundle, native, root, _, _ = deployment
+    (native / "launch_env.sh").write_bytes(b"export UNRELATED=keep\nexport FINGERPRINT=OLD_CAR\n")
+    deploy.activate(bundle, root, native, Path("/usr/bin/python3"), fingerprint="TESLA_MODEL_3")
+    lines = (native / "launch_env.sh").read_text().splitlines()
+    assert [line for line in lines if "FINGERPRINT" in line] == ["export FINGERPRINT=TESLA_MODEL_3"]
+    deploy.activate(bundle, root, native, Path("/usr/bin/python3"))
+    assert "FINGERPRINT" not in (native / "launch_env.sh").read_text()
+    assert "export UNRELATED=keep" in (native / "launch_env.sh").read_text()
+
+
+@pytest.fixture
+def bundling(tmp_path, monkeypatch):
+    """build_bundle on a copy of this checkout's native files, with uv and git faked."""
+    import tarfile
+
+    from drivingbench.device import deploy
+
+    root = Path(__file__).resolve().parents[1]
+    repo = tmp_path / "repo"
+    for side in ("native", "vendor/openpilot"):
+        for name in deploy.NATIVE_FILES:
+            (repo / side / name).parent.mkdir(parents=True, exist_ok=True)
+            (repo / side / name).write_bytes((root / side / name).read_bytes())
+
+    def run(command, **kw):
+        if command[:2] == ["uv", "build"]:
+            wheels = Path(command[command.index("--out-dir") + 1])
+            wheels.mkdir(parents=True, exist_ok=True)
+            (wheels / "drivingbench_harness-1.1.0-py3-none-any.whl").write_bytes(b"")
+
+    def git(command, **kw):
+        return "" if "status" in command else "release123\nupstream456\n"
+
+    monkeypatch.setattr(deploy.subprocess, "run", run)
+    monkeypatch.setattr(deploy.subprocess, "check_output", git)
+
+    def build():
+        output = deploy.build_bundle(
+            repo, tmp_path / "bundle.tgz", root / "device/initial-settings.json"
+        )
+        with tarfile.open(output) as archive:
+            files = {m.name: archive.extractfile(m).read() for m in archive if m.isfile()}
+        return json.loads(files.pop("manifest.json")), files
+
+    return deploy, repo, build
+
+
+def test_bundle_ships_native_files_with_their_stock_submodule_digests(bundling):
+    deploy, repo, build = bundling
+    manifest, files = build()
+    assert manifest["release"] == "release123" and manifest["upstream"] == "upstream456"
+    for name in deploy.NATIVE_FILES:
+        stock, modified = (repo / "vendor/openpilot" / name), (repo / "native" / name)
+        assert files[f"native/{name}"] == modified.read_bytes()
+        assert manifest["native"][name] == {
+            "baseline": deploy.digest(stock.read_bytes()),
+            "installed": deploy.digest(modified.read_bytes()),
+        }
+    assert {"activate.py", "initial-settings.json"} <= files.keys()
+
+
+def test_bundle_refuses_an_uninitialized_submodule(bundling):
+    deploy, repo, build = bundling
+    (repo / "vendor/openpilot" / deploy.NATIVE_FILES[1]).unlink()
+    with pytest.raises(ValueError, match="git submodule update --init vendor/openpilot"):
+        build()
+
+
+def test_native_files_are_drivingbench_edits_of_the_stock_submodule():
+    from drivingbench.device.deploy import NATIVE_FILES
+
+    root = Path(__file__).resolve().parents[1]
+    assert sorted(str(p.relative_to(root / "native")) for p in (root / "native").rglob("*.py")) == (
+        sorted(NATIVE_FILES)
+    )
+    for name in NATIVE_FILES:
+        stock = (root / "vendor/openpilot" / name).read_bytes()
+        assert b"drivingbench" not in stock.lower()
+        assert (root / "native" / name).read_bytes() != stock
 
 
 def test_activation_refuses_busy_producer_port_before_native_changes(deployment, monkeypatch):
@@ -374,13 +418,20 @@ def test_install_runtime_builds_a_venv_outside_the_checkout(tmp_path, monkeypatc
 
     calls = []
     monkeypatch.setattr(
-        "drivingbench.gateway.install.subprocess.run", lambda args, **kw: calls.append(args)
+        "drivingbench.gateway.install.subprocess.run", lambda args, **kw: calls.append((args, kw))
+    )
+    monkeypatch.setattr(
+        "drivingbench.gateway.provenance.source_state",
+        lambda repo: {"revision": "test", "files": {}},
     )
     executables = install_runtime(Path("/repo/checkout"), tmp_path / "runtime")
     assert executables == tmp_path / "runtime/venv/bin"
-    assert calls[0][:2] == ["uv", "venv"] and calls[0][-1] == str(tmp_path / "runtime/venv")
-    assert calls[1][:3] == ["uv", "pip", "install"] and calls[1][-1] == "/repo/checkout"
-    assert "--python" in calls[1] and str(tmp_path / "runtime/venv/bin/python") in calls[1]
+    args, options = calls[0]
+    assert args[:2] == ["uv", "sync"]
+    assert {"--locked", "--no-dev", "--no-editable"} <= set(args) and "--extra" not in args
+    assert args[args.index("--project") + 1] == "/repo/checkout"
+    assert options["env"]["UV_PROJECT_ENVIRONMENT"] == str(tmp_path / "runtime/venv")
+    assert json.loads((tmp_path / "runtime/install.json").read_text())["revision"] == "test"
 
 
 def test_install_gateway_retries_bootstrap_while_launchd_tears_down_the_old_job(

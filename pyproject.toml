@@ -4,16 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "drivingbench-harness"
-version = "1.0.0"
+version = "1.1.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["fastapi>=0.115,<1", "httpx>=0.28,<1", "huggingface_hub>=0.34,<2", "mcp>=1.12,<2", "pillow>=11,<13", "pydantic>=2.10,<3", "uvicorn>=0.34,<1", "tomlkit>=0.13,<1"]
+dependencies = ["fastapi>=0.115,<1", "httpx>=0.28,<1", "huggingface_hub>=0.34,<2", "mcp>=1.12,<2", "pillow>=11,<13", "pydantic>=2.10,<3", "uvicorn>=0.34,<1", "tomlkit>=0.13,<1", "websockets>=16,<17"]
 
 [project.scripts]
 drivingbench = "drivingbench.gateway.cli:main"
 drivingbench-sandbox = "drivingbench.mcp.tools:main"
 
 [tool.setuptools]
-packages = ["drivingbench", "drivingbench.controller", "drivingbench.device", "drivingbench.gateway", "drivingbench.mcp", "drivingbench.shared", "drivingbench.ui"]
+packages = ["drivingbench", "drivingbench.controller", "drivingbench.device", "drivingbench.gateway", "drivingbench.harness", "drivingbench.mcp", "drivingbench.shared", "drivingbench.ui"]
 package-dir = {drivingbench = "."}
 
 [tool.setuptools.package-data]
@@ -28,13 +28,19 @@ dev = [
     "pycapnp>=2,<3",
     "setproctitle>=1.3,<2",
     "zstandard>=0.25,<1",
-    "opendbc>=0.3.1",
+]
+# The simulator's build (sim/pipeline): `uv run --group sim-build python -m drivingbench.sim.pipeline`.
+sim-build = [
+    "contourpy>=1.3",
+    "matplotlib>=3.9",
+    "pycolmap==4.2.1",
+    "scipy>=1.14",
 ]
 
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-extend-exclude = ["native"]
+extend-exclude = ["vendor", "native"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I"]
@@ -42,3 +48,4 @@ select = ["E4", "E7", "E9", "F", "I"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

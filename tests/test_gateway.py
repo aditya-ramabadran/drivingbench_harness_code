@@ -195,6 +195,7 @@ async def test_trace_viewer_routes_read_the_checkout_and_prefer_fetched_frames(t
                 "ended_at": "2026-09-16T10:00:09+00:00",
                 "events": 4,
                 "tool_calls": 1,
+                "plans": 0,
                 "session": "s1",
                 "chat": True,
             }
@@ -218,3 +219,43 @@ async def test_trace_viewer_routes_read_the_checkout_and_prefer_fetched_frames(t
         base_url="http://127.0.0.1",
     ) as client:
         assert (await client.get("/traces/api/index")).json() == {"segments": [], "sessions": []}
+
+
+async def test_evaluation_routes_are_not_shadowed_by_producer_proxy_and_record_attempts(tmp_path):
+    session = None
+
+    def handle(request):
+        nonlocal session
+        if request.url.path == "/status":
+            return httpx.Response(200, json={"protocol": 2, "session": session})
+        body = json.loads(request.content)
+        if request.url.path == "/session/start":
+            session = {"id": "trial", **body}
+            return httpx.Response(200, json=session)
+        return httpx.Response(200, json={**session, **body})
+
+    async with httpx.AsyncClient(
+        base_url="http://device", transport=httpx.MockTransport(handle)
+    ) as upstream:
+        async with browser(create_app(client=upstream, runs=tmp_path)) as client:
+            context = {"course": "layout-2", "operator": "AR"}
+            assert (await client.patch("/api/evaluations/context", json=context)).json() == context
+            assert (await client.get("/api/evaluations/context")).json() == context
+            extra = await client.patch("/api/evaluations/context", json={**context, "x": "y"})
+            assert extra.status_code == 422
+            assert (
+                await client.post("/api/session/start", json={"model": "model", "harness": "codex"})
+            ).is_success
+            ended = await client.post(
+                "/api/evaluations/attempt",
+                json={"action": "end", "outcome": "intervention", "note": "cone"},
+            )
+            assert ended.is_success and ended.json()["attempt"] == 1
+            assert (await client.post("/api/evaluations/attempt", json={"action": "start"})).json()[
+                "attempt"
+            ] == 2
+            events = [
+                json.loads(line)
+                for line in (tmp_path / "evaluations/events.jsonl").read_text().splitlines()
+            ]
+            assert events[0]["context"] == context and events[0]["context_mode"] == "same_context"

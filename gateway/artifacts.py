@@ -7,6 +7,7 @@ import hashlib
 import json
 import shlex
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +16,8 @@ from drivingbench.gateway.traces import read_events
 
 ROUTES = "/data/media/0/realdata"
 SEGMENT_SECONDS = 60  # openpilot writes one route segment per minute
+ROUTE_FILES = ("fcamera.hevc", "ecamera.hevc", "rlog.zst")  # road and wide video, full log
+SETTLED_S = 2 * SEGMENT_SECONDS  # a route minute this old is no longer being written
 
 
 def epoch(iso: str) -> float:
@@ -30,18 +33,25 @@ def frame_ids(traces: Path, session: dict) -> list[str]:
     return sorted(set(names))
 
 
-def overlapping_routes(listing: str, started: float, ended: float, margin=SEGMENT_SECONDS) -> list:
-    """From `find -printf '%T@ %f\\n'` output, the segments whose minute overlaps the session."""
-    chosen = []
+def route_times(listing: str) -> dict[str, float]:
+    """From `find -printf '%T@ %f\\n'` output, each route minute's last write time."""
+    times = {}
     for line in listing.splitlines():
         try:
             finished, name = line.split(maxsplit=1)
-            finished = float(finished)
+            times[name.strip()] = float(finished)
         except ValueError:
             continue
-        if finished - SEGMENT_SECONDS - margin <= ended and finished + margin >= started:
-            chosen.append(name.strip())
-    return sorted(chosen)
+    return times
+
+
+def overlapping_routes(listing: str, started: float, ended: float, margin=SEGMENT_SECONDS) -> list:
+    """The route minutes that overlap the session."""
+    return sorted(
+        name
+        for name, finished in route_times(listing).items()
+        if finished - SEGMENT_SECONDS - margin <= ended and finished + margin >= started
+    )
 
 
 def list_routes(config: Config) -> str:
@@ -60,6 +70,8 @@ def rsync(config: Config, remote: str, local: Path):
             "rsync",
             "-a",
             "--partial",
+            *(f"--include={name}" for name in ROUTE_FILES),
+            "--exclude=*",
             "-e",
             shlex.join(ssh_args(config)[:-1]),
             "--",
@@ -70,23 +82,32 @@ def rsync(config: Config, remote: str, local: Path):
     )
 
 
-def stage(config: Config, traces: Path, mirror: Path, session: dict, staging: Path) -> Path:
-    """Collect a session's bulk artifacts locally: frames from the mirror, routes from the comma.
+def stage(
+    config: Config, traces: Path, mirror: Path, session: dict, staging: Path, listing: str, now=None
+) -> Path:
+    """Collect a session's bulk artifacts locally: frames from the mirror, routes from the comma
+    (`listing`: list_routes, read once per sync).
 
-    The only step that needs the comma. Each route minute is pulled once into `staging/routes/`
-    and hard-linked into every session that overlaps it, so shared minutes cost one transfer.
+    The only step that needs the comma. Each route minute is pulled once into `staging/routes/`,
+    marked complete once it is settled, and hard-linked into every session that overlaps it, so
+    shared minutes cost one transfer and later syncs none.
     """
+    now = time.time() if now is None else now
     folder = staging / session["id"]
     (folder / "frames").mkdir(parents=True, exist_ok=True)
     for name in frame_ids(traces, session):
         source = mirror / "images" / name
         if source.is_file() and not (folder / "frames" / name).exists():
             (folder / "frames" / name).write_bytes(source.read_bytes())
+    times = route_times(listing)
     for route in overlapping_routes(
-        list_routes(config), epoch(session["started_at"]), epoch(session["ended_at"])
+        listing, epoch(session["started_at"]), epoch(session["ended_at"])
     ):
         cache = staging / "routes" / route
-        rsync(config, f"{ROUTES}/{shlex.quote(route)}/", cache)
+        if not (cache / ".complete").exists():
+            rsync(config, f"{ROUTES}/{shlex.quote(route)}/", cache)
+            if now - times[route] >= SETTLED_S:
+                (cache / ".complete").touch()
         link_tree(cache, folder / "routes" / route)
     return folder
 
@@ -102,7 +123,7 @@ def pending(traces: Path, session_ids) -> list[dict]:
 def link_tree(source: Path, target: Path):
     target.mkdir(parents=True, exist_ok=True)
     for file in source.iterdir():
-        if file.is_file() and not (target / file.name).exists():
+        if file.is_file() and not file.name.startswith(".") and not (target / file.name).exists():
             (target / file.name).hardlink_to(file)
 
 
@@ -153,20 +174,18 @@ def upload(config: Config, traces: Path, staging: Path) -> list[dict]:
     return report
 
 
-def fetch(config: Config, session_id: str, traces: Path, destination: Path) -> dict:
+def fetch(session_id: str, traces: Path, destination: Path) -> dict:
     """Download a session's bulk artifacts from where its manifest says they were uploaded."""
     from huggingface_hub import snapshot_download
 
-    if not config.dataset:
-        raise ValueError("No dataset configured; set it with drivingbench install --dataset")
     session = json.loads((traces / "sessions" / f"{session_id}.json").read_text())
-    path = (session.get("artifacts") or {}).get("path")
-    if not path:
+    artifacts = session.get("artifacts") or {}
+    if not artifacts.get("path"):
         raise ValueError(f"{session_id} has no uploaded artifacts")
     snapshot_download(
-        repo_id=config.dataset,
+        repo_id=artifacts["repo"],
         repo_type="dataset",
-        allow_patterns=[f"{path}/*"],
+        allow_patterns=[f"{artifacts['path']}/*"],
         local_dir=str(destination),
     )
-    return {"status": "fetched", "path": str(destination / path)}
+    return {"status": "fetched", "path": str(destination / artifacts["path"])}

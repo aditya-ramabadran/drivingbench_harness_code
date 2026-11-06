@@ -56,7 +56,7 @@ async def test_offline_inventory_is_small_strict_and_carries_the_hard_limits():
         description = tools["set_motion"].description
         assert f"typically {TYPICAL_SPEED_MPS}" in description
         assert f"about {TYPICAL_DURATION_S:g} s" in description and "timestamps" in description
-        assert schema["properties"]["reason"]["maxLength"] == 200
+        assert schema["properties"]["reason"]["maxLength"] == 600
         stop = tools["stop_now"].inputSchema
         assert set(stop["properties"]) == {"reason"} and not stop.get("required")
 
@@ -83,8 +83,10 @@ async def test_reason_is_forwarded_recorded_but_never_echoed(motion):
         assert requests[-1] == {"reason": "Pedestrian stepping off the curb."}
         await server.call_tool("stop_now", {})  # a terse model can still stop
         assert requests[-1] == {"reason": ""}
+        await server.call_tool("set_motion", motion | {"reason": "x" * 400})  # wordy, not refused
+        assert requests[-1]["reason"] == "x" * 400
         with pytest.raises(Exception, match="validation|Validation|invalid|Invalid"):
-            await server.call_tool("set_motion", motion | {"reason": "x" * 201})
+            await server.call_tool("set_motion", motion | {"reason": "x" * 601})
 
 
 async def test_images_are_separate_and_writes_are_small(motion):

@@ -11,8 +11,8 @@ import time
 from pathlib import Path
 
 import tomlkit
+from drivingbench.shared.contracts import SERVER_NAME
 
-SERVER_NAME = "drivingbench_sandbox"
 GATEWAY_LABEL = "com.drivingbench.v01.gateway"
 
 
@@ -42,7 +42,6 @@ def client_paths(home: Path | None = None) -> dict[str, Path]:
 
 
 def render_config(client: str, original: bytes, command: str, gateway_url: str) -> bytes:
-    entry = {"command": command, "args": ["--gateway-url", gateway_url, "--client", client]}
     if client == "codex":
         document = tomlkit.parse(original.decode())
         servers = document.setdefault("mcp_servers", tomlkit.table())
@@ -53,7 +52,10 @@ def render_config(client: str, original: bytes, command: str, gateway_url: str) 
         servers = document.setdefault("mcpServers", {})
     if not hasattr(servers, "items"):
         raise ValueError("MCP server configuration must be an object")
-    servers[SERVER_NAME] = entry
+    servers[SERVER_NAME] = {
+        "command": command,
+        "args": ["--gateway-url", gateway_url, "--client", client],
+    }
     return (
         tomlkit.dumps(document) if client == "codex" else json.dumps(document, indent=2) + "\n"
     ).encode()
@@ -71,11 +73,25 @@ def install_runtime(repo: Path, runtime: Path = RUNTIME) -> Path:
     """
     runtime.mkdir(parents=True, exist_ok=True)
     venv = runtime / "venv"
-    subprocess.run(["uv", "venv", "--quiet", "--allow-existing", str(venv)], check=True)
     subprocess.run(
-        ["uv", "pip", "install", "--quiet", "--python", str(venv / "bin/python"), str(repo)],
+        [
+            "uv",
+            "sync",
+            "--locked",
+            "--no-dev",
+            "--no-editable",
+            "--reinstall-package",
+            "drivingbench-harness",
+            "--project",
+            str(repo),
+            "--quiet",
+        ],
+        env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(venv)},
         check=True,
     )
+    from drivingbench.gateway.provenance import source_state
+
+    atomic_write(runtime / "install.json", json.dumps(source_state(repo), indent=2).encode())
     return venv / "bin"
 
 

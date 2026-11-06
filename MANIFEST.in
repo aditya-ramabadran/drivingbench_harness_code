@@ -1,4 +1,5 @@
 prune native
+prune vendor
 prune runs
 prune tests
 include README.md

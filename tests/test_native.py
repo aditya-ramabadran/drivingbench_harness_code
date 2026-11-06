@@ -3,24 +3,20 @@
 import json
 import math
 import socket
-import sys
 import tempfile
-import types
 from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
+from drivingbench.sim.logs import use_openpilot
 
-# The patched drive_helpers is imported from native/; the two openpilot constants it needs
-# are stubbed so the test needs no openpilot checkout. VehicleModel comes from PyPI opendbc.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "native/drivingbench"))
-sys.modules["openpilot.common.constants"] = types.SimpleNamespace(ACCELERATION_DUE_TO_GRAVITY=9.81)
-sys.modules["openpilot.common.realtime"] = types.SimpleNamespace(DT_CTRL=0.01, DT_MDL=0.05)
+# The openpilot submodule and its opendbc, with native/'s patched drive_helpers in place of stock.
+use_openpilot()
 
 from drivingbench.controller.core import Selection  # noqa: E402
 from drivingbench.device.ipc import NativeServer, encode  # noqa: E402
-from drivingbench.device.native import Bridge  # noqa: E402
-from drivingbench.shared.contracts import Settings  # noqa: E402
+from drivingbench.device.native import Bridge, unsupported  # noqa: E402
+from drivingbench.shared.contracts import Settings, curvature, wheel_angle  # noqa: E402
 from opendbc.car.vehicle_model import VehicleModel  # noqa: E402
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature  # noqa: E402
 
@@ -47,13 +43,11 @@ class Inputs(dict):
 def vm():
     return VehicleModel(
         NS(
-            mass=1430,
-            rotationalInertia=2500,
+            rotationalInertiaPerMass=2500 / 1430,
             wheelbase=2.7,
             centerToFront=1.08,
-            steerRatioRear=0,
-            tireStiffnessFront=80000,
-            tireStiffnessRear=80000,
+            tireStiffnessFrontPerMass=80000 / 1430,
+            tireStiffnessRearPerMass=80000 / 1430,
             steerRatio=17.8,
         )
     )
@@ -134,12 +128,13 @@ def test_soft_disable_deceleration_is_preserved(vm):
 
 def test_status_replies_carry_recorder_evidence_without_touching_control(vm):
     server = Server()
-    bridge = Bridge(server, clock=lambda: 1)
+    bridge = Bridge(server, clock=lambda: 1, wheelbase=2.7)
     sm = inputs(angle=130, offset=10)
     server.messages = [dict(protocol=2, operation="heartbeat")]
     bridge.tick(sm, lateral_active=True, longitudinal_active=True)
     first = server.results[-1]
     assert first["steering_raw_deg"] == 130 and first["steering_deg"] == 120
+    assert first["curvature_inv_m"] == pytest.approx(math.tan(math.radians(120) / 17.8) / 2.7)
     assert first["lateral_active"] and first["longitudinal_active"]
     assert first["issued_curvature"] is None and first["curvature_limited"] is None
     bridge.controller.sample.lateral_active = True
@@ -158,7 +153,7 @@ def test_status_records_torque_path_and_clears_invalid_sources():
     bridge = Bridge(server, clock=lambda: 1)
     sm = inputs()
     cs = sm["carState"]
-    output = NS(actuatorsOutput=NS(torque=0.6, torqueOutputCan=900))
+    output = NS(actuatorsOutput=NS(torque=0.6, torqueOutputCan=900, steeringAngleDeg=7.0))
     bridge.tick(sm, lateral_active=True, longitudinal_active=True)
     bridge.record_steering_evidence(
         car_state=cs,
@@ -168,12 +163,14 @@ def test_status_records_torque_path_and_clears_invalid_sources():
         panda_states=[NS(safetyTxBlocked=3), NS(safetyTxBlocked=0)],
         panda_states_valid=True,
         requested_torque=0.75,
+        requested_angle=-12.5,
         limited_by_safety=True,
     )
     server.messages = [dict(protocol=2, operation="status")]
     bridge.tick(sm, lateral_active=True, longitudinal_active=True)
     evidence = server.results[-1]
     assert evidence["requested_torque_normalized"] == 0.75
+    assert evidence["requested_angle_deg"] == -12.5 and evidence["applied_angle_deg"] == 7.0
     assert evidence["applied_torque_normalized"] == 0.6
     assert evidence["applied_torque_can"] == 900
     assert evidence["eps_torque_can"] == 420
@@ -195,6 +192,7 @@ def test_status_records_torque_path_and_clears_invalid_sources():
         panda_states=[],
         panda_states_valid=False,
         requested_torque=0,
+        requested_angle=0,
         limited_by_safety=None,
     )
     assert bridge.evidence["steering_limited_by_safety"] is None
@@ -208,12 +206,14 @@ def test_status_records_torque_path_and_clears_invalid_sources():
         panda_states=[NS(safetyTxBlocked=4)],
         panda_states_valid=False,
         requested_torque=math.nan,
+        requested_angle=math.nan,
         limited_by_safety=False,
     )
     server.messages = [dict(protocol=2, operation="heartbeat")]
     bridge.tick(sm, lateral_active=True, longitudinal_active=True)
     stale = server.results[-1]
     assert stale["requested_torque_normalized"] is None
+    assert stale["requested_angle_deg"] is None and stale["applied_angle_deg"] is None
     assert stale["applied_torque_normalized"] is None
     assert stale["applied_torque_can"] is None
     assert stale["eps_torque_can"] is None
@@ -335,7 +335,7 @@ def test_nonfinite_native_sample_is_unknown_in_status(vm):
     bridge.tick(sm, lateral_active=False, longitudinal_active=False)
     status = server.results[-1]
     assert status["speed_mps"] is None and status["steering_deg"] is None
-    assert not status["sensors_valid"]
+    assert status["curvature_inv_m"] is None and not status["sensors_valid"]
     json.dumps(status, allow_nan=False)
     issued, limited = bridge.apply_curvature(vm, math.nan, 0, 0)
     assert issued == 0 and limited
@@ -395,3 +395,102 @@ def test_stationary_recovery_requires_independently_fresh_car_state(vm, missing,
     assert bridge.controller.reason == reason
     assert bridge.controller.command is None
     assert not bridge.controller.status(0)["held"]
+
+
+def car(brand, fingerprint, *, steering="torque", tuning="torque", longitudinal=True):
+    """CarParams as controlsd sees them: a capnp reader, not opendbc's dataclass."""
+    from opendbc.car.structs import car as schema
+
+    message = schema.CarParams.new_message(
+        brand=brand,
+        carFingerprint=fingerprint,
+        steerControlType=steering,
+        openpilotLongitudinalControl=longitudinal,
+    )
+    message.lateralTuning.init(tuning)
+    return schema.CarParams.from_bytes(message.to_bytes()).__enter__()
+
+
+def test_only_toyota_torque_and_tesla_angle_with_openpilot_speed_control_are_supported():
+    assert unsupported(car("toyota", "TOYOTA_PRIUS_TSS2")) is None
+    assert unsupported(car("tesla", "TESLA_MODEL_3", steering="angle", tuning="pid")) is None
+    tesla_without_speed = car("tesla", "TESLA_MODEL_3", steering="angle", longitudinal=False)
+    assert "enable AlphaLongitudinalEnabled" in unsupported(tesla_without_speed)
+    assert "longitudinal" in unsupported(car("toyota", "TOYOTA_RAV4", longitudinal=False))
+    assert "TOYOTA_COROLLA" in unsupported(car("toyota", "TOYOTA_COROLLA", tuning="pid"))
+    assert "HONDA_CIVIC" in unsupported(car("honda", "HONDA_CIVIC"))
+    assert unsupported(car("tesla", "TESLA_MODEL_3", steering="torque")) is not None
+
+
+def test_an_unsupported_car_latches_a_reported_failure_and_never_moves(monkeypatch):
+    with tempfile.TemporaryDirectory(prefix="db-gate-", dir="/tmp") as directory:
+        monkeypatch.setenv("DRIVINGBENCH_MODE", "experimental")
+        monkeypatch.setenv("DRIVINGBENCH_NATIVE_SOCKET", str(Path(directory) / "native"))
+        cp = car("tesla", "TESLA_MODEL_3", steering="angle", longitudinal=False)
+        bridge = Bridge.from_environment(cp)
+        bridge.server.close()
+        bridge.server = Server()
+        bridge.server.messages = [
+            dict(protocol=2, operation="heartbeat"),
+            dict(protocol=2, operation="motion"),
+        ]
+        selection = bridge.tick(inputs(), lateral_active=True, longitudinal_active=True)
+        status, motion = bridge.server.results
+        assert "AlphaLongitudinalEnabled" in status["native_error"]
+        assert status["vehicle"] == "TESLA_MODEL_3"
+        assert motion["reason"] == "native_bridge_failed"
+        assert selection.should_stop and not selection.resume
+
+
+def test_tesla_geometry_reaches_its_340_degree_scale_without_the_generic_cap():
+    from opendbc.car.tesla.interface import CarInterface
+
+    tesla = VehicleModel(CarInterface.get_non_essential_params("TESLA_MODEL_3"))
+    bridge = Bridge(Server())
+    bridge.controller.sample.lateral_active = True
+    bridge.controller.settings.max_steering_angle_deg = 340
+    bridge.selection = Selection(340)
+    desired = -tesla.calc_curvature(math.radians(340), 1.0, 0)
+    issued, limited = bridge.apply_curvature(tesla, 1.0, 0, desired)
+    assert not limited and issued == pytest.approx(desired)
+    assert 1 / abs(issued) == pytest.approx(5.8, abs=0.2)  # the Model 3's turning circle
+    assert bridge.controller.issued_angle == pytest.approx(340)
+
+
+@pytest.mark.parametrize("ratio", [11.5, 13.0])
+def test_a_recorded_wheel_angle_replayed_as_a_chunk_is_the_angle_the_car_is_asked_for(ratio):
+    from opendbc.car.tesla.interface import CarInterface
+
+    tesla = VehicleModel(CarInterface.get_non_essential_params("TESLA_MODEL_3"))
+    tesla.update_params(1.0, ratio)  # the learned ratio, as controlsd sets it
+    bridge = Bridge(Server())
+    bridge.controller.sample.lateral_active = True
+    bridge.controller.settings.max_steering_angle_deg = 340
+    for recorded in (-330, -200, -40, 15, 120, 300):
+        exported = float(curvature(recorded, ratio, tesla.l))
+        for speed in (0.5, 1.5, 3.5):
+            bridge.selection = Selection(0, curvature_inv_m=exported)
+            previous = tesla.calc_curvature(math.radians(-recorded), speed, 0)
+            issued, limited = bridge.apply_curvature(tesla, speed, 0, previous)
+            assert not limited
+            assert bridge.controller.issued_angle == pytest.approx(recorded, abs=1e-6)
+            assert issued == pytest.approx(-tesla.calc_curvature(math.radians(recorded), speed, 0))
+
+
+def test_a_chunk_curvature_is_capped_by_the_shared_scale():
+    from opendbc.car.tesla.interface import CarInterface
+
+    tesla = VehicleModel(CarInterface.get_non_essential_params("TESLA_MODEL_3"))
+    bridge = Bridge(Server())
+    bridge.controller.sample.lateral_active = True
+    bridge.controller.settings.max_steering_angle_deg = 340
+    angle = float(wheel_angle(0.05, tesla.sR, tesla.l))
+    scale_curvature = tesla.calc_curvature(math.radians(340), 1.0, 0)
+    bridge.selection = Selection(0, curvature_inv_m=0.9)  # beyond what the scale allows
+    issued, limited = bridge.apply_curvature(tesla, 1.0, 0, -scale_curvature)
+    assert limited and issued == pytest.approx(-scale_curvature)
+    assert bridge.controller.issued_angle == pytest.approx(340)
+    bridge.controller.sample.lateral_active = False
+    bridge.selection = Selection(0, curvature_inv_m=-0.05)  # right, so openpilot's positive
+    issued, _ = bridge.apply_curvature(tesla, 1.0, 0, 0.0)
+    assert bridge.controller.issued_angle == pytest.approx(-angle) and issued > 0

@@ -8,25 +8,8 @@
   let historyPending = false;
   let historySignature = "";
   let producerId = null;
+  const LIVE_MS = 20000;
 
-  function selectTab(selected) {
-    for (const name of ["setup", "drive"]) {
-      node(`${name}-panel`).hidden = name !== selected;
-      node(`${name}-tab`).setAttribute("aria-selected", String(name === selected));
-      node(`${name}-tab`).tabIndex = name === selected ? 0 : -1;
-    }
-    if (selected === "drive") refresh();
-  }
-  for (const name of ["setup", "drive"]) {
-    node(`${name}-tab`).addEventListener("click", () => selectTab(name));
-    node(`${name}-tab`).addEventListener("keydown", (event) => {
-      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-      event.preventDefault();
-      const next = event.key === "Home" ? "setup" : event.key === "End" ? "drive" : name === "setup" ? "drive" : "setup";
-      selectTab(next);
-      node(`${next}-tab`).focus();
-    });
-  }
   window.addEventListener("drivingbench-status", ({ detail: status }) => {
     if (status?.producer_id && status.producer_id !== producerId) {
       producerId = status.producer_id;
@@ -45,7 +28,7 @@
     const age = frame && Math.max(0, (performance.now() - frame.capturedAt) / 1000);
     node(`drive-${name}-status`).textContent = frame
       ? `Last image ${age.toFixed(1)} s old${frame.producerId !== producerId ? " · previous producer" : ""}${error ? ` · waiting for next frame (${error})` : ""}`
-      : error ? `Image unavailable: ${error}` : "Waiting for an image.";
+      : error ? `Image unavailable: ${error}` : camerasLive() ? "Waiting for an image." : "Images update only while switched on.";
   }
   async function camera(name) {
     const state = cameras[name];
@@ -115,7 +98,6 @@
       ? `${text(a.direction)} ${Number.isFinite(a.steering_percent) ? a.steering_percent : "?"}% · ${fmt(a.speed_mps)} m/s · ${fmt(a.duration_s, 1)} s`
       : call.tool === "stop_now" ? "Brake now; authorization kept" : `Operator ${text(call.tool)}`;
     if (o.error) return { tone: "error", params, outcome: `Rejected · ${text(o.error)}` };
-    if (call.tool === "set_motion" && "speed_mps" in o) return { tone: "clamped", params, outcome: `Accepted · speed clamped to ${fmt(o.speed_mps)} m/s` };
     const status = text(o.status || "accepted");
     return { tone: "accepted", params, outcome: status[0].toUpperCase() + status.slice(1) };
   }
@@ -199,11 +181,29 @@
     row.append(raw);
     return row;
   }
-  function refresh() {
-    if (node("drive-panel").hidden) return;
-    for (const name of Object.keys(cameras)) camera(name);
-    history();
+  // Full-size previews and history share the comma link with model frames and commands, so
+  // they download only while the operator asks: each switch starts off and turns itself off.
+  function live(id) {
+    const box = node(id);
+    let timer = null;
+    box.addEventListener("change", () => {
+      clearTimeout(timer);
+      if (box.checked) timer = setTimeout(() => { box.checked = false; refresh(); }, LIVE_MS);
+      refresh();
+    });
+    return () => box.checked === true;
   }
+  const camerasLive = live("cameras-live");
+  const historyLive = live("history-live");
+  function refresh() {
+    Object.keys(cameras).forEach(cameraLabel);
+    if (document.visibilityState === "hidden") return;
+    if (node("live-cameras").open && camerasLive()) for (const name of Object.keys(cameras)) camera(name);
+    if (node("drive-panel").hidden === false && historyLive()) history();
+  }
+  window.addEventListener("drivingbench-tab", refresh);
+  node("live-cameras").addEventListener("toggle", refresh);
+  document.addEventListener("visibilitychange", refresh);
   setInterval(refresh, 500);
   setInterval(() => Object.keys(cameras).forEach(cameraLabel), 200);
 })();

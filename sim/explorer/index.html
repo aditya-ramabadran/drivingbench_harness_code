@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Foothill Lot Explorer</title>
+<style>
+  :root { --ink: #f4f4f2; --muted: #b9bdb7; --panel: rgba(18, 20, 19, 0.72); --accent: #ffb547; }
+  html, body { margin: 0; height: 100%; background: #101211; color: var(--ink);
+    font: 13px/1.45 ui-sans-serif, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  .hud { position: fixed; left: 14px; top: 14px; max-width: 330px; padding: 12px 14px;
+    background: var(--panel); border-radius: 10px; backdrop-filter: blur(6px); }
+  .hud h1 { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
+  .hud p { margin: 0 0 8px; color: var(--muted); }
+  .keys { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 0; }
+  .keys dt { color: var(--accent); font-family: ui-monospace, Menlo, monospace; }
+  .keys dd { margin: 0; color: var(--muted); }
+  .readout { position: fixed; right: 14px; bottom: 14px; padding: 8px 12px; background: var(--panel);
+    border-radius: 8px; font-family: ui-monospace, Menlo, monospace; color: var(--muted); }
+  .loading { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none;
+    color: var(--muted); font-size: 15px; }
+  .hidden { display: none; }
+  /* Pushing against the drivable region's edge: the screen's sides glow red, fading after. */
+  .edge { position: fixed; inset: 0; pointer-events: none; opacity: 0;
+    box-shadow: inset 0 0 90px 24px rgba(230, 40, 30, 0.75); }
+</style>
+</head>
+<body>
+<div class="hud" id="hud">
+  <h1>Foothill lot · 27 October</h1>
+  <p>A Gaussian splat trained from the car's road camera over one afternoon (15:30–17:00), with
+    the real cones removed and the course's cones placed back as objects: measured from the
+    footage, completed into two rows. You can go wherever the simulated car can: the course's lane,
+    a little beyond its cones. Coordinates are the course frame in metres.</p>
+  <dl class="keys">
+    <dt>drag</dt><dd>look around</dd>
+    <dt>W S ↑ ↓</dt><dd>forward / back · Q/E down/up (to 3 m) · Shift faster</dd>
+    <dt>A D ← →</dt><dd>turn left / right</dd>
+    <dt>1</dt><dd>car view at the course start</dd>
+    <dt>2</dt><dd>raised view where you stand, on/off</dd>
+    <dt>V</dt><dd>road camera's field of view (36°) / wide (60°)</dd>
+    <dt>C</dt><dd>course line, finish and drivable edge on/off</dd>
+    <dt>K</dt><dd>inserted cones on/off</dd>
+    <dt>H</dt><dd>hide this panel</dd>
+  </dl>
+</div>
+<div class="readout" id="readout"></div>
+<div class="edge" id="edge"></div>
+<div class="loading" id="loading">Loading splat…</div>
+<script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/",
+      "@sparkjsdev/spark": "https://cdn.jsdelivr.net/npm/@sparkjsdev/spark@2.3.1/dist/spark.module.js"
+    }
+  }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+
+const CAMERA_HEIGHT = 1.24;  // the road camera above the asphalt (sim/render.py)
+const ASPHALT = 0x41464c;  // median asphalt colour in the real road-camera frames (65, 70, 76)
+const ROAD_FOV = 36.3, WIDE_FOV = 60;
+const LIFT = [-0.9, 3];  // metres above the road camera: from higher, the splat is streaks
+
+// ?render=1: no controls; the simulator calls window.renderAt for the simulated car's camera.
+const RENDER = new URLSearchParams(location.search).has("render");
+const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: RENDER });
+renderer.setPixelRatio(RENDER ? 1 : Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x9fb4c8);
+const camera = new THREE.PerspectiveCamera(WIDE_FOV, innerWidth / innerHeight, 0.05, 2000);
+scene.add(new SparkRenderer({ renderer }));
+
+// The course frame is east-north-up; three.js is y-up. One group maps one to the other.
+const world = new THREE.Group();
+world.rotation.x = -Math.PI / 2;
+scene.add(world);
+// The site's splats (sim/explorer/serve.py): clean (1.5 M), full (all of them), raw (the real cones).
+const file = new URLSearchParams(location.search).get("file") || "clean";
+const splat = new SplatMesh({ url: `data/${file}.splat` });
+world.add(splat);
+splat.initialized.then(() => document.getElementById("loading").classList.add("hidden"));
+window.explorer = { scene, camera, splat, world };  // for debugging in the console
+
+// The driven ground (sim/course.py Ground): one height per cell, bilinear between cell centres.
+const G = await (await fetch("data/ground.json")).json();
+function groundAt(e, n) {
+  const [nx, ny] = G.shape, clamp = (v, hi) => Math.min(Math.max(v, 0), hi);
+  const u = clamp((e - G.origin[0]) / G.cell_m - 0.5, nx - 1), v = clamp((n - G.origin[1]) / G.cell_m - 0.5, ny - 1);
+  const i = Math.min(Math.floor(u), nx - 2), j = Math.min(Math.floor(v), ny - 2), a = u - i, b = v - j;
+  const z = (i, j) => G.z[i * ny + j];
+  return (1 - a) * ((1 - b) * z(i, j) + b * z(i, j + 1)) + a * ((1 - b) * z(i + 1, j) + b * z(i + 1, j + 1));
+}
+
+// The drivable region (the site's bounds, sim/pipeline/layout.py): the simulated car's body stays inside it,
+// and so does the explorer's viewpoint.
+const BOUNDS = (await (await fetch("data/bounds.json")).json()).polygon_enu_m;
+function inside(e, n) {  // even-odd rule, as sim/course.py
+  let odd = false;
+  for (let i = 0, j = BOUNDS.length - 1; i < BOUNDS.length; j = i++) {
+    const [x0, y0] = BOUNDS[i], [x1, y1] = BOUNDS[j];
+    if ((y0 > n) !== (y1 > n) && e < x0 + (n - y0) * (x1 - x0) / (y1 - y0)) odd = !odd;
+  }
+  return odd;
+}
+
+// The splat's asphalt is many faint splats; an opaque plane just below the lowest reconstructed
+// ground shows asphalt, not sky, wherever they leave gaps.
+const ground = new THREE.Mesh(new THREE.CircleGeometry(400, 64), new THREE.MeshBasicMaterial({ color: ASPHALT }));
+ground.position.set(60, 10, -0.6);
+world.add(ground);
+
+// Measured cones as objects, lit roughly like 16:00 (sun southwest, ~25° up).
+scene.add(new THREE.HemisphereLight(0xd4dde8, 0x4a4e52, 1.7));
+const sun = new THREE.DirectionalLight(0xfff0dc, 1.6);
+sun.position.set(-0.63, 0.45, 0.63);  // three.js frame: from the southwest, above
+scene.add(sun);
+// Sizes measured from the footage: small cones 0.19 m, domes 0.07 m, the inner-turn pair ~0.45 m.
+const materials = {
+  red: new THREE.MeshLambertMaterial({ color: 0xd8382c }),
+  green: new THREE.MeshLambertMaterial({ color: 0x8aa82a }),
+};
+const shadowMaterial = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.32, depthWrite: false });
+const shapes = {  // body, its centre height, base plate, shadow radius
+  cone: [new THREE.ConeGeometry(0.06, 0.19, 24), 0.095, new THREE.CylinderGeometry(0.09, 0.09, 0.012, 24), 0.14],
+  dome: [new THREE.CylinderGeometry(0.03, 0.095, 0.07, 24), 0.035, null, 0.13],
+  tall: [new THREE.ConeGeometry(0.11, 0.45, 24), 0.225, new THREE.BoxGeometry(0.26, 0.26, 0.02), 0.22],
+};
+const cones = new THREE.Group();
+world.add(cones);
+for (const c of (await (await fetch("data/cones.json")).json()).cones) {
+  const [body, lift, base, shadow] = shapes[c.kind], material = materials[c.colour];
+  const part = new THREE.Mesh(body, material);
+  part.rotation.x = Math.PI / 2;  // three.js cones point up y; the world group is z-up
+  part.position.set(c.x, c.y, c.z + lift);
+  cones.add(part);
+  if (base) {
+    const plate = new THREE.Mesh(base, material);
+    if (c.kind === "cone") plate.rotation.x = Math.PI / 2;  // the round flange lies flat
+    plate.position.set(c.x, c.y, c.z + 0.007);
+    cones.add(plate);
+  }
+  const shade = new THREE.Mesh(new THREE.CircleGeometry(shadow, 20), shadowMaterial);
+  shade.position.set(c.x - 0.04, c.y - 0.04, c.z + 0.004);
+  cones.add(shade);
+}
+cones.visible = file !== "raw";
+
+const overlay = new THREE.Group();
+world.add(overlay);
+const course = await (await fetch("data/course.json")).json();
+const line = (points, color, z = 0.06) => new THREE.Line(
+  new THREE.BufferGeometry().setFromPoints(points.map(([x, y]) => new THREE.Vector3(x, y, z))),
+  new THREE.LineBasicMaterial({ color }));
+overlay.add(line(course.centerline_enu_m, 0xffb547));
+const finish = course.finish_zone_enu_m;
+overlay.add(line([...finish, finish[0]], 0x58d68d));
+overlay.add(line([...BOUNDS, BOUNDS[0]], 0xe0503c, 0.04));
+
+// Pose in the course frame: position (east, north, up), heading from east, counterclockwise.
+// Exploring, `lift` is the height above the car's camera (Q/E); `u` follows the ground.
+const pose = { e: 0, n: 0, u: CAMERA_HEIGHT, lift: 0, heading: 0, pitch: 0 };
+function place(p) {
+  // East-north-up to three.js: (e, n, u) -> (e, u, -n).
+  camera.position.set(p.e, p.u, -p.n);
+  if (p.forward) {  // an exact orientation, e.g. a reconstructed camera's (roll included)
+    const [fe, fn, fu] = p.forward, [ue, un, uu] = p.up;
+    camera.up.set(ue, uu, -un);
+    camera.lookAt(p.e + fe, p.u + fu, -p.n - fn);
+    return;
+  }
+  camera.up.set(0, 1, 0);
+  const c = Math.cos(p.pitch);
+  camera.lookAt(p.e + c * Math.cos(p.heading), p.u + Math.sin(p.pitch), -p.n - c * Math.sin(p.heading));
+}
+
+if (RENDER) {
+  for (const id of ["hud", "readout", "loading"]) document.getElementById(id).classList.add("hidden");
+  overlay.visible = false;
+  const frame = () => new Promise((done) => requestAnimationFrame(done));
+  // One view of the simulated camera: pose in the course frame, vertical field of view in degrees.
+  // A lost WebGL context draws nothing: refuse, and the simulator reloads the page.
+  window.renderAt = async (view) => {
+    if (renderer.getContext().isContextLost()) throw new Error("the WebGL context was lost");
+    if (renderer.domElement.width !== view.width || renderer.domElement.height !== view.height) {
+      renderer.setSize(view.width, view.height, false);
+    }
+    camera.aspect = view.width / view.height;
+    camera.fov = view.fov;
+    camera.updateProjectionMatrix();
+    place(view);
+    // Spark re-sorts splats for a new viewpoint in a worker; let it settle before reading back.
+    for (let i = 0; i < view.settle; i++) {
+      renderer.render(scene, camera);
+      await frame();
+    }
+    renderer.render(scene, camera);
+    return renderer.domElement.toDataURL("image/jpeg", 0.95).split(",", 2)[1];
+  };
+  await splat.initialized;
+  window.explorerReady = true;
+} else {
+  explore();
+}
+
+function explore() {
+  function carView() {
+    const [a, b] = [course.centerline_enu_m[0], course.centerline_enu_m[6]];
+    Object.assign(pose, { e: a[0], n: a[1], lift: 0, pitch: 0,
+      heading: Math.atan2(b[1] - a[1], b[0] - a[0]) });
+  }
+  function raised() {  // a toggle: up to the cap, or back down to the road camera
+    Object.assign(pose, pose.lift > 0 ? { lift: 0, pitch: 0 } : { lift: LIFT[1], pitch: -0.25 });
+  }
+  carView();
+
+  const keys = new Set();
+  addEventListener("keydown", (e) => {
+    keys.add(e.code);
+    if (e.code === "Digit1") carView();
+    if (e.code === "Digit2") raised();
+    if (e.code === "KeyC") overlay.visible = !overlay.visible;
+    if (e.code === "KeyK") cones.visible = !cones.visible;
+    if (e.code === "KeyH") document.getElementById("hud").classList.toggle("hidden");
+    if (e.code === "KeyV") {
+      camera.fov = camera.fov === WIDE_FOV ? ROAD_FOV : WIDE_FOV;
+      camera.updateProjectionMatrix();
+    }
+  });
+  addEventListener("keyup", (e) => keys.delete(e.code));
+  let dragging = false;
+  renderer.domElement.addEventListener("pointerdown", (e) => { dragging = true; e.target.setPointerCapture(e.pointerId); });
+  renderer.domElement.addEventListener("pointerup", () => { dragging = false; });
+  renderer.domElement.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    pose.heading -= e.movementX * 0.003;
+    pose.pitch = Math.max(-1.5, Math.min(1.5, pose.pitch - e.movementY * 0.003));
+  });
+  addEventListener("resize", () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+
+  const readout = document.getElementById("readout"), edge = document.getElementById("edge");
+  let last = performance.now(), glow = 0;
+  renderer.setAnimationLoop((now) => {
+    const dt = Math.min(0.1, (now - last) / 1000);
+    last = now;
+    const fast = keys.has("ShiftLeft") || keys.has("ShiftRight");
+    const speed = (fast ? 12 : 3) * dt;
+    const fwd = (keys.has("KeyW") || keys.has("ArrowUp")) - (keys.has("KeyS") || keys.has("ArrowDown"));
+    const turn = (keys.has("KeyA") || keys.has("ArrowLeft")) - (keys.has("KeyD") || keys.has("ArrowRight"));
+    pose.heading += turn * (fast ? 2.1 : 1.05) * dt;  // 60°/s, 120°/s with Shift
+    // Moves stay inside the drivable region, sliding along its edge; pushing on it glows red.
+    const de = speed * fwd * Math.cos(pose.heading), dn = speed * fwd * Math.sin(pose.heading);
+    const blocked = fwd !== 0 && !inside(pose.e + de, pose.n + dn);
+    if (!blocked) [pose.e, pose.n] = [pose.e + de, pose.n + dn];
+    else if (inside(pose.e + de, pose.n)) pose.e += de;
+    else if (inside(pose.e, pose.n + dn)) pose.n += dn;
+    glow = blocked ? Math.min(1, glow + 6 * dt) : Math.max(0, glow - 2.5 * dt);
+    edge.style.opacity = glow;
+    pose.lift = Math.min(LIFT[1], Math.max(LIFT[0], pose.lift + speed * (keys.has("KeyE") - keys.has("KeyQ"))));
+    pose.u = groundAt(pose.e, pose.n) + CAMERA_HEIGHT + pose.lift;
+    place(pose);
+    readout.textContent = `E ${pose.e.toFixed(1)}  N ${pose.n.toFixed(1)}  ${(CAMERA_HEIGHT + pose.lift).toFixed(2)} m up  ` +
+      `heading ${(((90 - pose.heading * 180 / Math.PI) % 360) + 360) % 360 | 0}°  fov ${camera.fov.toFixed(0)}°`;
+    renderer.render(scene, camera);
+  });
+}
+</script>
+</body>
+</html>
