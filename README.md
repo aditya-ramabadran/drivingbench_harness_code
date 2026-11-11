@@ -184,7 +184,8 @@ steering and speed, and every call with its reason. To benchmark, start a **labe
 To drive the simulator instead, start it where the tunnel would be and leave the comma offline:
 
 ```sh
-uv run python -m drivingbench.sim.runtime --placeholder   # or without, once the splat is built
+uvx --from huggingface_hub hf download drivingbench/simulator --repo-type dataset --include "*.splat" --local-dir runs/sim/explorer
+uv run python -m drivingbench.sim.runtime   # --placeholder for plain frames, without the splat
 ```
 
 Afterwards, on the laptop that drove:

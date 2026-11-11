@@ -41,9 +41,16 @@ uv sync --locked
 ```
 
 The course, ground, cones, drivable region and fitted car are committed under `sim/`. The splat
-is not, nor are the drives it is built from: build it from drives of your own with the pipeline
-(below), or run with `--placeholder` (plain frames). The splat camera renders in headless Google
-Chrome at its macOS location.
+is published on Hugging Face ([drivingbench/simulator](https://huggingface.co/datasets/drivingbench/simulator),
+CC BY 4.0); download it where the site file expects it:
+
+```sh
+uvx --from huggingface_hub hf download drivingbench/simulator --repo-type dataset --include "*.splat" --local-dir runs/sim/explorer
+```
+
+The drives it is built from are not published: build a splat from drives of your own with the
+pipeline (below), or run with `--placeholder` (plain frames). The splat camera renders in headless
+Google Chrome at its macOS location.
 
 ## Run
 
@@ -94,7 +101,7 @@ reprojection, 1.9 m median from GPS it never saw, per-step heading 0.05° from t
 15:30–17:00, scores 22.6 dB PSNR and 0.80 SSIM on 168 held-out views. Of the course's 144 cones,
 111 stand as measured, 8 were moved onto their row and 25 fill gaps few frames saw; against the
 cones the reference run itself detected within 12 m, its recall is 83% and its precision 70%.
-Every reconstructed pose of the seven attempts that completed this layout keeps the whole body
+Every reconstructed pose of the five attempts that completed this layout keeps the whole body
 inside the drivable region.
 
 **Real attempts replayed** (`sim/faithfulness.py`, the two attempts that scored 100%). From each
@@ -118,8 +125,8 @@ uv run python -m drivingbench.sim.explorer.serve   # http://127.0.0.1:8890
 The splat and inserted cones in the browser (three.js and Spark from jsDelivr), in the course
 frame: a car view at the road camera's height, a raised view (`2`), the course line, finish and
 drivable edge (`C`), the cones on and off (`K`). Walking stays inside the drivable region.
-`?file=full` loads all 3.0 M splats (the default keeps the 1.5 M most opaque), `?file=raw` the
-splat with its real cones.
+`?file=full` loads all 3.0 M splats (the default keeps the 1.5 M most opaque); `?file=raw`, the
+splat with its real cones, is not published.
 
 ## Build
 
