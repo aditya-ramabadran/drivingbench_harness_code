@@ -26,7 +26,9 @@ Conventions for people and coding agents working in this repository. Read
   MCP, compatibility aliases, or limits that the car and openpilot do not require.
 - The public MCP is exactly `drivingbench_sandbox` with `observe`, `set_motion`,
   `stop_now`. Tool inputs and outputs stay tiny; images are separate content
-  blocks on `observe` only. Speed above the shared ceiling is rejected; there is no
+  blocks on `observe` only. The Prime Agent skill (`mcp/prime_agent`) is the same three tools as
+  Python functions, plus `read()` and `history()` for code; `tests/test_prime_agent.py` keeps its
+  calls, results and descriptions equal to `mcp/tools.py`. Speed above the shared ceiling is rejected; there is no
   fixed ceiling in schemas. The optional `reason` on `set_motion`/`stop_now` is recorded
   evidence: never required, never echoed, never read by the controller.
 - Steering is a percent of one shared scale in steering-wheel degrees, calibrated

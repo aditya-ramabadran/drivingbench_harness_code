@@ -4,7 +4,8 @@ A small harness that lets an AI model drive a real car at parking-lot speed whil
 sits in the driver's seat with a foot over the brake. It runs on a [comma](https://comma.ai)
 device with [openpilot](https://github.com/commaai/openpilot) in a supported Toyota or Tesla.
 Any chat app that speaks MCP (Codex, Claude Code, Cursor) gets one server,
-`drivingbench_sandbox`, with three tools: `observe`, `set_motion`, `stop_now`. Models without
+`drivingbench_sandbox`, with three tools: `observe`, `set_motion`, `stop_now`;
+[Prime Agent](#with-prime-agent) gets the same tools as Python functions. Models without
 a chat app, decision models and trained driving policies drive through the same interface from
 the laptop's runner loop, and a simulator of the benchmark course runs underneath all of
 them. Everything the model says and does, and everything the car did, is recorded as a trace
@@ -46,6 +47,14 @@ The safety measures are the human ones:
   on your car ([docs/steering-calibration.md](docs/steering-calibration.md)).
 - Know your local law. Operating a modified driver-assistance system, even on private ground,
   may be regulated where you live. That is your problem to solve before you drive.
+
+## What's new in v1.2
+
+- **Prime Agent** drives through a skill, [`mcp/prime_agent`](mcp/prime_agent): the three tools
+  as Python functions in its kernel, plus `read()` and `history()` for code
+  ([With Prime Agent](#with-prime-agent)).
+- The tools describe a command's duration as its lifetime, not a minimum interval before its
+  replacement, and `reason` as optional; the suggested 10 s duration is gone.
 
 ## What's new in v1.1
 
@@ -188,6 +197,24 @@ uvx --from huggingface_hub hf download drivingbench/simulator --repo-type datase
 uv run python -m drivingbench.sim.runtime   # --placeholder for plain frames, without the splat
 ```
 
+### With Prime Agent
+
+[Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) drops images that come back over
+MCP, so it drives through a skill instead: [`mcp/prime_agent`](mcp/prime_agent) puts `observe`,
+`set_motion` and `stop_now` in its Python kernel as functions, with the MCP server's descriptions,
+results and limits, and `observe` attaches the camera images itself. Code also gets `read()`,
+the same observation as a dict and PIL images with nothing attached, and `history()`, every
+earlier call with its frames. With the gateway running and a model that accepts images (tested
+with Prime Agent 0.10.5):
+
+```sh
+prime-agent --skill /path/to/drivingbench_harness_code/mcp/prime_agent
+```
+
+`DRIVINGBENCH_GATEWAY_URL` points it at a gateway other than `http://127.0.0.1:8766`. The skill
+gives the model the car; the practice, preparation and attempt phases we ran it in are an
+operator's protocol, not part of this release.
+
 Afterwards, on the laptop that drove:
 
 ```sh
@@ -218,6 +245,7 @@ describes the layout.
 | `gateway/traces.py` `artifacts.py` `evaluations.py` | Trace publishing, bulk artifacts, attempt metadata |
 | `harness/` | The runner: chat model, decision driver, trained policies |
 | `mcp/tools.py` | The three tools over plain HTTP |
+| `mcp/prime_agent/` | The same tools as Python functions for Prime Agent, plus `read()` and `history()` |
 | `shared/contracts.py` | `Motion`, `Chunk`, `Settings`, limits, protocol number |
 | `sim/` | The simulator, its course and fitted car, and the pipeline that builds them |
 | `ui/` | Setup, Drive, Runner and trace viewer pages |
