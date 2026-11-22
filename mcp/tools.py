@@ -16,7 +16,6 @@ from drivingbench.shared.contracts import (
     REASON_MAX_CHARS,
     SERVER_NAME,
     SPEED_RANGE_MPS,
-    TYPICAL_DURATION_S,
     TYPICAL_SPEED_MPS,
 )
 from mcp.server.fastmcp import FastMCP
@@ -91,7 +90,7 @@ def make_server(client: httpx.AsyncClient, label="MCP"):
     ) -> list:
         """Replace motion now. Percent is 0–100 of the shared wheel-angle setting; zero is straight.
 
-        {limits} Duration includes steering buildup and launch delay. Expiry starts braking, not
+        {limits} Duration is the lifetime, not a minimum replacement interval. It includes steering buildup and launch delay. Expiry starts braking, not
         guaranteed standstill. Compare timestamps across calls to learn your own latency.
 
         reason: optional short note on what this command is for; recorded, never executed.
@@ -121,8 +120,7 @@ def make_server(client: httpx.AsyncClient, label="MCP"):
         limits=(
             f"Speed {SPEED_RANGE_MPS[0]}–{SPEED_RANGE_MPS[1]} m/s, typically {TYPICAL_SPEED_MPS}; "
             "above the operator's shared ceiling it is rejected. "
-            f"Duration {DURATION_RANGE_S[0]:g}–{DURATION_RANGE_S[1]:g} s; aim for about "
-            f"{TYPICAL_DURATION_S:g} s and adjust to what you learn."
+            f"Duration {DURATION_RANGE_S[0]:g}–{DURATION_RANGE_S[1]:g} s."
         )
     )
     for function in (observe, set_motion, stop_now):

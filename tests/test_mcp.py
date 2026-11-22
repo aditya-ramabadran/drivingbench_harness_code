@@ -8,7 +8,6 @@ from drivingbench.mcp.tools import make_server
 from drivingbench.shared.contracts import (
     DURATION_RANGE_S,
     SPEED_RANGE_MPS,
-    TYPICAL_DURATION_S,
     TYPICAL_SPEED_MPS,
 )
 
@@ -55,7 +54,7 @@ async def test_offline_inventory_is_small_strict_and_carries_the_hard_limits():
         assert (duration["minimum"], duration["maximum"]) == DURATION_RANGE_S
         description = tools["set_motion"].description
         assert f"typically {TYPICAL_SPEED_MPS}" in description
-        assert f"about {TYPICAL_DURATION_S:g} s" in description and "timestamps" in description
+        assert "not a minimum replacement interval" in description and "timestamps" in description
         assert schema["properties"]["reason"]["maxLength"] == 600
         stop = tools["stop_now"].inputSchema
         assert set(stop["properties"]) == {"reason"} and not stop.get("required")
